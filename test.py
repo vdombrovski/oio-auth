@@ -1,14 +1,47 @@
 import requests
 import json
+import sys
+
 
 url = "http://localhost:8080"
 
-res = requests.post(url + "/api/v1/projects", data=json.dumps(dict(project="biloute")))
-print(res.__dict__)
-res = requests.post(url + "/api/v1/users", data=json.dumps(dict(project="biloute", user="test")))
-print(res.__dict__)
-res = requests.post(url + "/api/v1/keys", data=json.dumps(dict(project="biloute", user="test")))
-print(res.__dict__)
+
+def dft():
+    res = requests.post(url + "/api/v1/projects", data=json.dumps(dict(project="biloute")))
+    print(res.__dict__)
+    res = requests.post(url + "/api/v1/users", data=json.dumps(dict(project="biloute", user="test")))
+    print(res.__dict__)
+    res = requests.post(url + "/api/v1/keys", data=json.dumps(dict(project="biloute", user="test")))
+    print(res.json())
+
+def delk():
+    res = requests.delete(url + "/api/v1/keys", data=json.dumps(dict(project="biloute", user="test", access="oio1505ff4aebb9b76a0ea12cc9e3a91")))
+    print(res.json())
+
+def delu():
+    res = requests.delete(url + "/api/v1/users", data=json.dumps(dict(project="biloute", user="test")))
+    print(res.__dict__)
+
+def delp():
+    res = requests.delete(url + "/api/v1/projects", data=json.dumps(dict(project="biloute")))
+    print(res.__dict__)
+
+def getk():
+    res = requests.get(url + "/api/v1/keys", data=json.dumps(dict(project="biloute", user="test")))
+    print(res.json())
+
+def getu():
+    res = requests.get(url + "/api/v1/users", data=json.dumps(dict(project="biloute")))
+    print(res.json())
+
+dft()
+# delp()
+#delu()
+#delk()
+#
+# getk()
+#getu()
+
 
 # url = "http://10.10.10.11:6006/v3.0/OPENIO/"
 #

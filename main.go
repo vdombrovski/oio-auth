@@ -68,7 +68,6 @@ func (hc *httpIface) decode(req *http.Request, into interface{}) error {
     if err != nil {
         return err
     }
-    fmt.Println("PROJECT", into)
     err = json.Unmarshal(body, into)
     if err != nil {
         return err
@@ -89,17 +88,28 @@ func (hc *httpIface) projectHandler(w http.ResponseWriter, req *http.Request) {
                 fmt.Println(err)
             }
             if p.Project == nil {
-                // MISSING PROJEàCT
+                // MISSING PROJECT
                 w.WriteHeader(http.StatusBadRequest)
                 return
             }
-            fmt.Println(hc.rep(*p.Project))
-            err = hc.PC.ContainerCreate(hc.rep(*p.Project))
-            fmt.Println(err)
-
+            _ = hc.PC.ContainerCreate(hc.rep(*p.Project))
+            // TODO: implement info on containers
+            // hc.PC.ObjectCreate(hc.rep(*p.Project), "self")
+            // hc.PC.ObjectSetProp(hc.rep(*p.Project), "self", map[string]string{"iam_name": *p.Project})
         case "DELETE":
-            // NOT IMPLEMENTED
-            break
+            ph := ""
+            p := project{Project: &ph}
+            hc.decode(req, &p)
+            if p.Project == nil {
+                // MISSING PROJECT / USER
+                w.WriteHeader(http.StatusBadRequest)
+                return
+            }
+            err := hc.PC.ContainerDel(hc.rep(*p.Project))
+            if err != nil {
+                w.WriteHeader(http.StatusBadRequest)
+                return
+            }
     }
 }
 
@@ -107,30 +117,73 @@ func (hc *httpIface) userHandler(w http.ResponseWriter, req *http.Request) {
     switch req.Method {
         case "GET":
             // NOT IMPLEMENTED
-            break
+            ph := ""
+            p := project{Project: &ph}
+            if p.Project == nil {
+                // MISSING PROJECT / USER
+                w.WriteHeader(http.StatusBadRequest)
+                return
+            }
+            hc.decode(req, &p)
+
+            users := []user{}
+
+            objects, _ := hc.PC.ObjectList(hc.rep(*p.Project), true)
+            for _, obj := range(objects) {
+                name := obj.Properties["iam_name"]
+                users = append(users, user{User: &name})
+            }
+            // if err != nil {
+            //     w.WriteHeader(http.StatusBadRequest)
+            //     return
+            // }
+            res, _ := json.Marshal(users)
+            fmt.Fprintf(w, string(res))
         case "POST":
             ph := ""
             u := user{Project: &ph}
             hc.decode(req, &u)
-            fmt.Println(u)
             if u.Project == nil && u.User == nil {
                 // MISSING PROJECT
                 w.WriteHeader(http.StatusBadRequest)
                 return
             }
-            err := hc.PC.ObjectCreate(hc.rep(*u.Project), hc.rep(*u.User))
-            fmt.Println(err)
+            hc.PC.ObjectCreate(hc.rep(*u.Project), hc.rep(*u.User))
+            hc.PC.ObjectSetProp(hc.rep(*u.Project), hc.rep(*u.User), map[string]string{"iam_name": *u.User})
         case "DELETE":
-            // NOT IMPLEMENTED
-            break
+            ph := ""
+            u := user{Project: &ph}
+            hc.decode(req, &u)
+            if u.Project == nil || u.User == nil {
+                // MISSING PROJECT / USER
+                w.WriteHeader(http.StatusBadRequest)
+                return
+            }
+            err := hc.PC.ObjectDel(hc.rep(*u.Project), hc.rep(*u.User))
+            if err != nil {
+                w.WriteHeader(http.StatusBadRequest)
+                return
+            }
     }
 }
 
 func (hc *httpIface) keyHandler(w http.ResponseWriter, req *http.Request) {
     switch req.Method {
         case "GET":
-            // NOT IMPLEMENTED
-            break
+            ph := ""
+            u := user{Project: &ph}
+            hc.decode(req, &u)
+            res := []key{}
+            keys, _ := hc.PC.ObjectGetProp(hc.rep(*u.Project), hc.rep(*u.User))
+            for access, secret := range(keys) {
+                res = append(res, key{
+                    Access: &access,
+                    Secret: &secret,
+                })
+            }
+            data, _ := json.Marshal(res)
+            fmt.Fprintf(w, string(data))
+
         case "POST":
             ph := ""
             u := user{Project: &ph}
@@ -141,7 +194,7 @@ func (hc *httpIface) keyHandler(w http.ResponseWriter, req *http.Request) {
                 return
             }
             access, secret := hc.newToken(*u.Project, *u.User)
-            err := hc.PC.ObjectSet(*u.Project, *u.User, map[string]string{access: secret})
+            err := hc.PC.ObjectSetProp(hc.rep(*u.Project), hc.rep(*u.User), map[string]string{access: secret})
             if err != nil {
                 // Something wrong!
                 w.WriteHeader(http.StatusBadRequest)
@@ -155,8 +208,19 @@ func (hc *httpIface) keyHandler(w http.ResponseWriter, req *http.Request) {
             })
             fmt.Fprintf(w, string(data))
         case "DELETE":
-            // NOT IMPLEMENTED
-            break
+            ph := ""
+            k := key{Access: &ph}
+            hc.decode(req, &k)
+            if k.Access == nil || k.Project == nil || k.User == nil {
+                // MISSING ACCESS KEY / PROJECT / USER
+                w.WriteHeader(http.StatusBadRequest)
+                return
+            }
+            err := hc.PC.ObjectDelProp(hc.rep(*k.Project), hc.rep(*k.User), *k.Access)
+            if err != nil {
+                w.WriteHeader(http.StatusBadRequest)
+                return
+            }
     }
 }
 
@@ -201,10 +265,9 @@ func (hc *httpIface) miscHandler(w http.ResponseWriter, req *http.Request) {
 }
 
 func (hc *httpIface) tokenHandler(w http.ResponseWriter, req *http.Request) {
-    var projectID = "Project ID whatever"
-    var project = "demo"
-    var user = "demo"
-    var secret = "b1c1348e3a5646d3974c7ac722ac0fdd"
+    // var project = "demo"
+    // var user = "demo"
+    // var secret = "b1c1348e3a5646d3974c7ac722ac0fdd"
 
     defer req.Body.Close()
     body, err := ioutil.ReadAll(req.Body)
@@ -212,11 +275,21 @@ func (hc *httpIface) tokenHandler(w http.ResponseWriter, req *http.Request) {
         w.WriteHeader(http.StatusBadRequest)
         return
     }
-    if signV4(string(body[73:253]), secret) != string(body[270:334]) {
-        w.WriteHeader(http.StatusForbidden)
+
+    project := string(body[36:44])
+    user := string(body[44:52])
+
+    data, err := hc.PC.ObjectGetProp(project, user)
+
+    if secret, ok := data[string(body[28:60])]; ok {
+        if signV4(string(body[73:253]), secret) != string(body[270:334]) {
+            w.WriteHeader(http.StatusForbidden)
+            return
+        }
+        fmt.Fprintf(w, respTpl, project, project, user)
         return
     }
-    fmt.Fprintf(w, respTpl, projectID, project, user)
+    w.WriteHeader(http.StatusBadRequest)
 }
 
 func signV4(toSignBytes, secret string) (string) {
