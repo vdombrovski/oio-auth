@@ -27,7 +27,10 @@ if len(sys.argv) >= 4:
 if len(sys.argv) >= 5:
     data['user'] = sys.argv[4]
 if len(sys.argv) == 6:
-    data['access'] = sys.argv[5]
+    if sys.argv[1] == "user":
+        data['password'] = sys.argv[5]
+    else:
+        data['access'] = sys.argv[5]
 
 res = getattr(requests, method)(BASE + "/api/v1/%ss" % sys.argv[1], data=json.dumps(data))
 try:

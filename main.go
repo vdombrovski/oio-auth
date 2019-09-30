@@ -9,10 +9,14 @@ import (
     "crypto/sha256"
     "encoding/hex"
     "fmt"
+    "log"
     "encoding/json"
-    "oioiam/oio"
     "math/rand"
     "time"
+    "errors"
+    "oioiam/oio"
+    "oioiam/keystore"
+    "golang.org/x/crypto/pbkdf2"
 )
 
 var seed = []byte("changeme")
@@ -29,6 +33,7 @@ type project struct {
 type user struct {
     Project *string `json:"project"`
     User *string `json:"user"`
+    Password *string `json:"password"`
 }
 
 type key struct {
@@ -40,17 +45,27 @@ type key struct {
 
 type httpIface struct {
     PC *oio.ProxyClient
+    KS *keystore.KeyStore
+    // TODO: Store in memcached
+    authTokens []string
 }
 
 func makeHTTPIface() *httpIface {
+    // openssl genrsa -des3 -out private.pem 2048
+    ks, err := keystore.MakeKeyStore("/tmp/private.pem", "testytest")
+    if err != nil {
+        log.Fatal(err)
+    }
     return &httpIface{
         PC: oio.MakeProxyClient("http://10.10.10.11:6006", "OPENIO"),
+        KS: ks,
     }
 }
 
 func main() {
     hc := makeHTTPIface()
     // Administration interface
+    http.HandleFunc("/api/v1/auth", hc.authHandler)
     http.HandleFunc("/api/v1/users", hc.userHandler)
     http.HandleFunc("/api/v1/projects", hc.projectHandler)
     http.HandleFunc("/api/v1/keys", hc.keyHandler)
@@ -75,11 +90,54 @@ func (hc *httpIface) decode(req *http.Request, into interface{}) error {
     return nil
 }
 
+func (hc *httpIface) authHandler(w http.ResponseWriter, req *http.Request) {
+    switch req.Method {
+        case "POST":
+            ph := ""
+            u := user{Project: &ph}
+            hc.decode(req, &u)
+            if u.Project == nil || u.User == nil || u.Password == nil  {
+                w.WriteHeader(http.StatusForbidden)
+                return
+            }
+            props, err := hc.PC.ObjectGetProp(hc.rep(*u.Project), hc.rep(*u.User))
+            if err != nil {
+                // TODO: 503
+                w.WriteHeader(http.StatusBadRequest)
+                return
+            }
+            if pwd, ok := props["pwd"]; ok {
+                if hc.hashPassword(*u.Password) == pwd {
+                    rand.Seed(time.Now().UnixNano())
+                    token := make([]byte, 256)
+                    rand.Read(token)
+                    fmt.Fprintf(w, "{\"token\": \"" + base64.StdEncoding.EncodeToString(token)[:32] + "\"}")
+                    return
+                }
+            }
+            // Current user doesn't have any password?
+            w.WriteHeader(http.StatusForbidden)
+            return
+    }
+}
+
 func (hc *httpIface) projectHandler(w http.ResponseWriter, req *http.Request) {
     switch req.Method {
         case "GET":
-            // NOT IMPLEMENTED
-            break
+            projects := []project{}
+
+            props, _ := hc.PC.ObjectGetProp("self", "projects")
+            for _, data := range props {
+                _, proj, err := hc.decodeKeyPair(data)
+                if err != nil {
+                    // Invalid project encryption format, ignore it
+                    continue
+                }
+                projects = append(projects, project{Project: &proj})
+            }
+            res, _ := json.Marshal(projects)
+            fmt.Fprintf(w, string(res))
+            return
         case "POST":
             ph := ""
             var p = project{Project: &ph}
@@ -92,8 +150,16 @@ func (hc *httpIface) projectHandler(w http.ResponseWriter, req *http.Request) {
                 w.WriteHeader(http.StatusBadRequest)
                 return
             }
+
+            err = hc.addIndex("name", *p.Project, "projects")
+            if err != nil {
+                // Something wrong with indexing layer
+                w.WriteHeader(http.StatusBadRequest)
+                return
+            }
+
             _ = hc.PC.ContainerCreate(hc.rep(*p.Project))
-            // TODO: implement info on containers
+            // TODO: implement info on containers, encrypt data
             // hc.PC.ObjectCreate(hc.rep(*p.Project), "self")
             // hc.PC.ObjectSetProp(hc.rep(*p.Project), "self", map[string]string{"iam_name": *p.Project})
         case "DELETE":
@@ -105,7 +171,14 @@ func (hc *httpIface) projectHandler(w http.ResponseWriter, req *http.Request) {
                 w.WriteHeader(http.StatusBadRequest)
                 return
             }
+
+            // TODO: ROLLBACK if one of the operations fails
             err := hc.PC.ContainerDel(hc.rep(*p.Project))
+            if err != nil {
+                w.WriteHeader(http.StatusBadRequest)
+                return
+            }
+            err = hc.delIndex(*p.Project, "projects")
             if err != nil {
                 w.WriteHeader(http.StatusBadRequest)
                 return
@@ -116,7 +189,6 @@ func (hc *httpIface) projectHandler(w http.ResponseWriter, req *http.Request) {
 func (hc *httpIface) userHandler(w http.ResponseWriter, req *http.Request) {
     switch req.Method {
         case "GET":
-            // NOT IMPLEMENTED
             ph := ""
             p := project{Project: &ph}
             if p.Project == nil {
@@ -127,29 +199,42 @@ func (hc *httpIface) userHandler(w http.ResponseWriter, req *http.Request) {
             hc.decode(req, &p)
 
             users := []user{}
-
-            objects, _ := hc.PC.ObjectList(hc.rep(*p.Project), true)
-            for _, obj := range(objects) {
-                name := obj.Properties["iam_name"]
-                users = append(users, user{User: &name})
+            props, _ := hc.PC.ObjectGetProp("self", "users")
+            for _, data := range props {
+                proj, usr, err := hc.decodeKeyPair(data)
+                if err != nil {
+                    // Invalid project encryption format, ignore it
+                    continue
+                }
+                if proj == *p.Project {
+                    users = append(users, user{User: &usr})
+                }
             }
-            // if err != nil {
-            //     w.WriteHeader(http.StatusBadRequest)
-            //     return
-            // }
             res, _ := json.Marshal(users)
             fmt.Fprintf(w, string(res))
+        // TODO : implement PUT method for password change
         case "POST":
             ph := ""
             u := user{Project: &ph}
             hc.decode(req, &u)
-            if u.Project == nil && u.User == nil {
+            if u.Project == nil || u.User == nil || u.Password == nil  {
                 // MISSING PROJECT
                 w.WriteHeader(http.StatusBadRequest)
                 return
             }
+            // TODO: return 409 on error
             hc.PC.ObjectCreate(hc.rep(*u.Project), hc.rep(*u.User))
-            hc.PC.ObjectSetProp(hc.rep(*u.Project), hc.rep(*u.User), map[string]string{"iam_name": *u.User})
+            err := hc.addIndex(*u.Project, *u.User, "users")
+            if err != nil {
+                // Something wrong with indexing layer
+                w.WriteHeader(http.StatusBadRequest)
+                return
+            }
+            // TODO: can this be done at object creation?
+            hc.PC.ObjectSetProp(hc.rep(*u.Project), hc.rep(*u.User), map[string]string{
+                "pwd": hc.hashPassword(*u.Password),
+            })
+
         case "DELETE":
             ph := ""
             u := user{Project: &ph}
@@ -159,12 +244,42 @@ func (hc *httpIface) userHandler(w http.ResponseWriter, req *http.Request) {
                 w.WriteHeader(http.StatusBadRequest)
                 return
             }
+            // TODO: implement rollback
             err := hc.PC.ObjectDel(hc.rep(*u.Project), hc.rep(*u.User))
             if err != nil {
                 w.WriteHeader(http.StatusBadRequest)
                 return
             }
+            err = hc.delIndex(*u.User, "users")
+            if err != nil {
+                w.WriteHeader(http.StatusBadRequest)
+                return
+            }
     }
+}
+
+func(hc *httpIface) hashPassword(pwd string) string {
+	return base64.StdEncoding.EncodeToString(pbkdf2.Key([]byte(pwd), seed, 10000, 50, sha256.New))
+}
+
+func (hc *httpIface) addIndex(key, value, t string) error {
+    data := key + ":" + value
+    enc, err := hc.KS.Encrypt(data)
+    if err != nil {
+        // Something wrong with encryption layer
+        return err
+    }
+
+    // TODO: consider doing this at init
+    _ = hc.PC.ContainerCreate("self")
+    _ = hc.PC.ObjectCreate("self", t)
+    return hc.PC.ObjectSetProp("self", t, map[string]string{
+        hc.rep(data): enc,
+    })
+}
+
+func (hc *httpIface) delIndex(index, t string) error {
+    return hc.PC.ObjectDelProp("self", t, hc.rep(index))
 }
 
 func (hc *httpIface) keyHandler(w http.ResponseWriter, req *http.Request) {
@@ -175,7 +290,16 @@ func (hc *httpIface) keyHandler(w http.ResponseWriter, req *http.Request) {
             hc.decode(req, &u)
             res := []key{}
             keys, _ := hc.PC.ObjectGetProp(hc.rep(*u.Project), hc.rep(*u.User))
-            for access, secret := range(keys) {
+            for index, keyPair := range(keys) {
+                if len(index) != 8 {
+                    // Not an access key
+                    continue
+                }
+                access, secret, err := hc.decodeKeyPair(keyPair)
+                if err != nil {
+                    // Invalid/corrupted key, log and continue
+                    continue
+                }
                 res = append(res, key{
                     Access: &access,
                     Secret: &secret,
@@ -194,7 +318,17 @@ func (hc *httpIface) keyHandler(w http.ResponseWriter, req *http.Request) {
                 return
             }
             access, secret := hc.newToken(*u.Project, *u.User)
-            err := hc.PC.ObjectSetProp(hc.rep(*u.Project), hc.rep(*u.User), map[string]string{access: secret})
+
+            enc, err := hc.KS.Encrypt(access + ":" + secret)
+            if err != nil {
+                // TODO: Error with encryption layer
+                w.WriteHeader(http.StatusBadRequest)
+                return
+            }
+
+            err = hc.PC.ObjectSetProp(hc.rep(*u.Project), hc.rep(*u.User), map[string]string{
+                hc.rep(access): enc,
+            })
             if err != nil {
                 // Something wrong!
                 w.WriteHeader(http.StatusBadRequest)
@@ -216,7 +350,7 @@ func (hc *httpIface) keyHandler(w http.ResponseWriter, req *http.Request) {
                 w.WriteHeader(http.StatusBadRequest)
                 return
             }
-            err := hc.PC.ObjectDelProp(hc.rep(*k.Project), hc.rep(*k.User), *k.Access)
+            err := hc.PC.ObjectDelProp(hc.rep(*k.Project), hc.rep(*k.User), hc.rep(*k.Access))
             if err != nil {
                 w.WriteHeader(http.StatusBadRequest)
                 return
@@ -226,6 +360,18 @@ func (hc *httpIface) keyHandler(w http.ResponseWriter, req *http.Request) {
 
 func (hc *httpIface) rep(entity string) string {
     return hex.EncodeToString(signSHA256(seed, []byte(entity)))[:8]
+}
+
+func (hc *httpIface) decodeKeyPair(key string) (string, string, error) {
+    decr, err := hc.KS.Decrypt(key)
+    if err != nil {
+        return "", "", err
+    }
+    kp := strings.Split(decr, ":")
+    if len(kp) != 2 {
+        return "", "", errors.New("token length mismatch")
+    }
+    return kp[0], kp[1], nil
 }
 
 func (hc *httpIface) newToken(project, user string) (string, string) {
@@ -265,9 +411,6 @@ func (hc *httpIface) miscHandler(w http.ResponseWriter, req *http.Request) {
 }
 
 func (hc *httpIface) tokenHandler(w http.ResponseWriter, req *http.Request) {
-    // var project = "demo"
-    // var user = "demo"
-    // var secret = "b1c1348e3a5646d3974c7ac722ac0fdd"
 
     defer req.Body.Close()
     body, err := ioutil.ReadAll(req.Body)
@@ -279,9 +422,15 @@ func (hc *httpIface) tokenHandler(w http.ResponseWriter, req *http.Request) {
     project := string(body[36:44])
     user := string(body[44:52])
 
+    // TODO: fetch from cache
     data, err := hc.PC.ObjectGetProp(project, user)
-
-    if secret, ok := data[string(body[28:60])]; ok {
+    if tokenData, ok := data[hc.rep(string(body[28:60]))]; ok {
+        _, secret, err := hc.decodeKeyPair(tokenData)
+        if err != nil {
+            // Invalid token
+            w.WriteHeader(http.StatusForbidden)
+            return
+        }
         if signV4(string(body[73:253]), secret) != string(body[270:334]) {
             w.WriteHeader(http.StatusForbidden)
             return
@@ -289,7 +438,8 @@ func (hc *httpIface) tokenHandler(w http.ResponseWriter, req *http.Request) {
         fmt.Fprintf(w, respTpl, project, project, user)
         return
     }
-    w.WriteHeader(http.StatusBadRequest)
+    w.WriteHeader(http.StatusForbidden)
+    return
 }
 
 func signV4(toSignBytes, secret string) (string) {
