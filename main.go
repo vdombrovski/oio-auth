@@ -21,6 +21,7 @@ import (
 )
 
 var seed = []byte("changeme")
+var tokenExpires = int32(86400)
 
 const respTpl = "{\"token\":{\"roles\":[]," +
 "\"project\":{\"domain\":{\"id\":\"\",\"name\":\"\"},\"id\":\"%s\",\"name\":\"%s\"}," +
@@ -44,10 +45,16 @@ type key struct {
     Secret *string `json:"secret"`
 }
 
+type cache interface {
+    Get(key string) (item *memcache.Item, err error)
+    Set(item *memcache.Item) error
+    Touch(key string, seconds int32) error
+}
+
 type httpIface struct {
     PC oio.Proxy
     KS keystore.KeyStore
-    Cache *memcache.Client
+    Cache cache
 }
 
 func makeHTTPIface() *httpIface {
@@ -101,6 +108,7 @@ func (hc *httpIface) decodeJSON(req *http.Request, into interface{}) error {
 
 func (hc *httpIface) authorize(proj, usr, token string, adminRequired bool) bool {
     if item, err := hc.Cache.Get(token); err == nil && item != nil {
+        hc.Cache.Touch(token, tokenExpires)
         data, err := hc.KS.Decrypt(string(item.Value))
         if err != nil {
             // Encryption backend error
@@ -244,6 +252,7 @@ func (hc *httpIface) authHandler(w http.ResponseWriter, req *http.Request) {
                     hc.Cache.Set(&memcache.Item{
                         Key: tokenStr,
                         Value: []byte(cipher),
+                        Expiration: tokenExpires,
                     })
                     fmt.Fprintf(w, "{\"token\": \"" + tokenStr + "\"}")
                     return
