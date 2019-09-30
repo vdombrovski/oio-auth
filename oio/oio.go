@@ -10,6 +10,17 @@ import (
     "strings"
 )
 
+type Proxy interface {
+    ContainerCreate(container string) error
+    ContainerDel(container string) error
+    ObjectCreate(container, object string) error
+    ObjectDel(container, object string) error
+    ObjectDelProp(container, object string, prop string) error
+    ObjectGetProp(container, object string) (map[string]string, error)
+    ObjectList(container string, props bool) ([]Object, error)
+    ObjectSetProp(container, object string, props map[string]string) error
+}
+
 type ProxyClient struct {
     proxyURL string
 }

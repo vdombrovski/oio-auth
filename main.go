@@ -17,6 +17,7 @@ import (
     "oioiam/keystore"
     "oioiam/util"
     "golang.org/x/crypto/pbkdf2"
+    "github.com/bradfitz/gomemcache/memcache"
 )
 
 var seed = []byte("changeme")
@@ -44,10 +45,9 @@ type key struct {
 }
 
 type httpIface struct {
-    PC *oio.ProxyClient
-    KS *keystore.KeyStore
-    // TODO: Store in memcached
-    auth map[string]user
+    PC oio.Proxy
+    KS keystore.KeyStore
+    Cache *memcache.Client
 }
 
 func makeHTTPIface() *httpIface {
@@ -59,9 +59,17 @@ func makeHTTPIface() *httpIface {
     return &httpIface{
         PC: oio.MakeProxyClient("http://10.10.10.11:6006", "OPENIO"),
         KS: ks,
-        auth: map[string]user{},
+        Cache: memcache.New("10.10.10.11:6019", "10.10.10.12:6019", "10.10.10.13:6019"),
     }
 }
+//
+// func main() {
+//      mc :=
+//      mc.Set(&memcache.Item{Key: "foo", Value: []byte("my value")})
+//
+//      it, err := mc.Get("foo")
+//      ...
+// }
 
 func main() {
     hc := makeHTTPIface()
@@ -92,7 +100,23 @@ func (hc *httpIface) decodeJSON(req *http.Request, into interface{}) error {
 }
 
 func (hc *httpIface) authorize(proj, usr, token string, adminRequired bool) bool {
-    if userData, ok := hc.auth[token]; ok {
+    if item, err := hc.Cache.Get(token); err == nil && item != nil {
+        data, err := hc.KS.Decrypt(string(item.Value))
+        if err != nil {
+            // Encryption backend error
+            return false
+        }
+        usrStr := strings.Split(data, "/")
+        if len(usrStr) != 3 {
+            fmt.Println("invalid cache")
+            // TODO: handle invalid cache
+            return false
+        }
+        userData := user{
+            Project: &usrStr[0],
+            User: &usrStr[1],
+            Role: &usrStr[2],
+        }
         isAdmin := *userData.Role != "admin"
         // Super users have all privileges
         if *userData.Project == "root" {
@@ -209,11 +233,18 @@ func (hc *httpIface) authHandler(w http.ResponseWriter, req *http.Request) {
                     token := make([]byte, 256)
                     rand.Read(token)
                     tokenStr := base64.StdEncoding.EncodeToString(token)[:32]
-                    hc.auth[tokenStr] = user{
-                        User: u.User,
-                        Project: u.Project,
-                        Role: &role,
+                    // TODO: encryption
+                    cipher, err := hc.KS.Encrypt(*u.Project + "/" + *u.User + "/" + role)
+                    if err != nil {
+                        // Encryption layer error
+                        // TODO: 503
+                        w.WriteHeader(http.StatusBadRequest)
+                        return
                     }
+                    hc.Cache.Set(&memcache.Item{
+                        Key: tokenStr,
+                        Value: []byte(cipher),
+                    })
                     fmt.Fprintf(w, "{\"token\": \"" + tokenStr + "\"}")
                     return
                 }
@@ -538,23 +569,39 @@ func (hc *httpIface) tokenHandler(w http.ResponseWriter, req *http.Request) {
 
     project := string(body[36:44])
     user := string(body[44:52])
+    access := hc.rep(string(body[28:60]))
+    tokenData := ""
 
-    // TODO: fetch from cache
-    data, err := hc.PC.ObjectGetProp(project, user)
-    if tokenData, ok := data[hc.rep(string(body[28:60]))]; ok {
-        _, secret, err := hc.decodeKeyPair(tokenData)
+    if item, err := hc.Cache.Get(access); (err != nil) && (item != nil) {
+        tokenData = string(item.Value)
+    } else {
+        data, err := hc.PC.ObjectGetProp(project, user)
         if err != nil {
-            // Invalid token
+            // OIO backend error?
+            // TODO: 503
             w.WriteHeader(http.StatusForbidden)
             return
         }
-        if util.SignV4(string(body[73:253]), secret) != string(body[270:334]) {
+        if token, ok := data[access]; ok {
+            tokenData = token
+            hc.Cache.Set(&memcache.Item{Key: access, Value: []byte(tokenData)})
+        } else {
             w.WriteHeader(http.StatusForbidden)
             return
         }
-        fmt.Fprintf(w, respTpl, project, project, user)
+    }
+    // Note: Asymetric encryption might have a performance impact,
+    // consider switching to symmetric encryption for cache (AES256)
+    _, secret, err := hc.decodeKeyPair(tokenData)
+
+    if err != nil {
+        // Invalid token
+        w.WriteHeader(http.StatusForbidden)
         return
     }
-    w.WriteHeader(http.StatusForbidden)
-    return
+    if util.SignV4(string(body[73:253]), secret) != string(body[270:334]) {
+        w.WriteHeader(http.StatusForbidden)
+        return
+    }
+    fmt.Fprintf(w, respTpl, project, project, user)
 }

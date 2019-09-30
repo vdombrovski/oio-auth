@@ -12,19 +12,24 @@ import (
     "errors"
 )
 
-type KeyStore struct {
+type KeyStore interface {
+	Encrypt(msg string) (string, error)
+	Decrypt(data string) (string, error)
+}
+
+type Store struct {
 	key *rsa.PrivateKey
 }
 
-func MakeKeyStore(path, pwd string) (*KeyStore, error){
+func MakeKeyStore(path, pwd string) (*Store, error){
 	key, err := loadPrivKey(path, pwd)
 	if err != nil {
 		return nil, err
 	}
-	return &KeyStore{key: key}, nil
+	return &Store{key: key}, nil
 }
 
-func (ks *KeyStore) Encrypt(msg string) (string, error) {
+func (ks *Store) Encrypt(msg string) (string, error) {
 	rng := rand.Reader
 	ct, err := rsa.EncryptOAEP(sha256.New(), rng, &ks.key.PublicKey, []byte(msg), []byte{})
 	if err != nil {
@@ -33,7 +38,7 @@ func (ks *KeyStore) Encrypt(msg string) (string, error) {
     return base64.StdEncoding.EncodeToString(ct), nil
 }
 
-func (ks *KeyStore) Decrypt(data string) (string, error) {
+func (ks *Store) Decrypt(data string) (string, error) {
 	ciphertext, _ := base64.StdEncoding.DecodeString(data)
 	rng := rand.Reader
 	msg, err := rsa.DecryptOAEP(sha256.New(), rng, ks.key, ciphertext, []byte{})
