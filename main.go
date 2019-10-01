@@ -6,6 +6,7 @@ import (
     "io/ioutil"
     "strings"
     "crypto/sha256"
+    "sync"
     "encoding/hex"
     "fmt"
     "log"
@@ -51,35 +52,59 @@ type cache interface {
     Touch(key string, seconds int32) error
 }
 
+type metrics struct {
+    sync.Mutex
+    RtData *int64 `json:"request_time_data"`
+    RtAdmin *int64 `json:"request_time_admin"`
+    RqData *int64 `json:"requests_data_total"`
+    RqData200 *int64 `json:"requests_data_200"`
+    RqData403 *int64 `json:"requests_data_403"`
+    RqData400 *int64 `json:"requests_data_400"`
+    RqData503 *int64 `json:"requests_data_503"`
+    RqAdmin *int64 `json:"requests_admin"`
+}
+
 type httpIface struct {
     PC oio.Proxy
     KS keystore.KeyStore
     Cache cache
+    Metrics metrics
 }
 
 func makeHTTPIface() *httpIface {
     // openssl genrsa -des3 -out private.pem 2048
-    ks, err := keystore.MakeKeyStore("/tmp/private.pem", "testytest")
-    if err != nil {
-        log.Fatal(err)
-    }
+    // ks, err := keystore.RSAKeystore("/tmp/private.pem", "testytest")
+    // if err != nil {
+    //     log.Fatal(err)
+    // }
+    ks := keystore.MakeAESStore("", "passphrase")
     return &httpIface{
         PC: oio.MakeProxyClient("http://10.10.10.11:6006", "OPENIO"),
         KS: ks,
         Cache: memcache.New("10.10.10.11:6019", "10.10.10.12:6019", "10.10.10.13:6019"),
+        Metrics: metrics{
+            RtData: new(int64),
+            RtAdmin: new(int64),
+            RqData: new(int64),
+            RqData200: new(int64),
+            RqData403: new(int64),
+            RqData400: new(int64),
+            RqData503: new(int64),
+            RqAdmin: new(int64),
+        },
     }
 }
-//
-// func main() {
-//      mc :=
-//      mc.Set(&memcache.Item{Key: "foo", Value: []byte("my value")})
-//
-//      it, err := mc.Get("foo")
-//      ...
-// }
 
 func main() {
     hc := makeHTTPIface()
+
+    // Bootstrap default root user
+    hc.PC.ContainerCreate(hc.rep("root"))
+    hc.PC.ObjectCreate(hc.rep("root"), hc.rep("root"))
+    hc.PC.ObjectSetProp(hc.rep("root"), hc.rep("root"), map[string]string{"pwd": hc.hashPassword("root")})
+    hc.addIndex("name", "root", "projects")
+    hc.addIndex("root", "root/root/admin", "users")
+
     // Administration interface
     http.HandleFunc("/api/v1/auth", hc.authHandler)
     http.HandleFunc("/api/v1/users", hc.userHandler)
@@ -87,6 +112,8 @@ func main() {
     http.HandleFunc("/api/v1/keys", hc.keyHandler)
     // Multi-cluster sync interface
     http.HandleFunc("/api/v1/sync", hc.cacheSyncHandler)
+    // Monitoring
+    http.HandleFunc("/api/v1/metrics", hc.metricHandler)
     // Token validation interface
     http.HandleFunc("/", hc.miscHandler)
     http.HandleFunc("/v2.0/s3tokens", hc.tokenHandler)
@@ -106,11 +133,31 @@ func (hc *httpIface) decodeJSON(req *http.Request, into interface{}) error {
     return nil
 }
 
+func (hc *httpIface) timeRequest(start time.Time, value *int64, total *int64) {
+    // Times request and averages it with the set value
+    // Should be deferred to be updated after the total counter
+    elapsed := time.Since(start).Nanoseconds() / 1e3
+    hc.Metrics.Lock()
+    if *value >= 0 && *total > 0 {
+        *value = (*value * (*total -1) + elapsed) / *total
+    } else {
+        *value = *total
+    }
+    hc.Metrics.Unlock()
+}
+
+func (hc *httpIface) bumpMetric(value *int64) {
+    hc.Metrics.Lock()
+    *value ++
+    hc.Metrics.Unlock()
+}
+
 func (hc *httpIface) authorize(proj, usr, token string, adminRequired bool) bool {
     if item, err := hc.Cache.Get(token); err == nil && item != nil {
         hc.Cache.Touch(token, tokenExpires)
         data, err := hc.KS.Decrypt(string(item.Value))
         if err != nil {
+            fmt.Println("encryption backend error")
             // Encryption backend error
             return false
         }
@@ -187,7 +234,11 @@ func (hc *httpIface) decodeKeyPair(key string) (string, string, error) {
     return kp[0], kp[1], nil
 }
 
-
+func (hc *httpIface) metricHandler(w http.ResponseWriter, req *http.Request) {
+    // Note: possibly a good idea to protect this route
+    res, _ := json.Marshal(hc.Metrics)
+    fmt.Fprintf(w, string(res))
+}
 
 func (hc *httpIface) cacheSyncHandler(w http.ResponseWriter, req *http.Request) {
     fmt.Println("cache sync")
@@ -221,11 +272,12 @@ func (hc *httpIface) authHandler(w http.ResponseWriter, req *http.Request) {
             for _, data := range userIndex {
                 _, usrDataStr, _ := hc.decodeKeyPair(data)
                 usrData := strings.Split(usrDataStr, "/")
-                if len(usrData) != 2 {
+                if len(usrData) != 3 {
+                    fmt.Println(usrData)
                     continue
                 }
-                if usrData[0] == *u.User {
-                    role = usrData[1]
+                if usrData[1] == *u.User {
+                    role = usrData[2]
                     break
                 }
             }
@@ -568,7 +620,7 @@ func (hc *httpIface) keyHandler(w http.ResponseWriter, req *http.Request) {
 }
 
 func (hc *httpIface) tokenHandler(w http.ResponseWriter, req *http.Request) {
-
+    defer hc.timeRequest(time.Now(), hc.Metrics.RtData, hc.Metrics.RqData)
     defer req.Body.Close()
     body, err := ioutil.ReadAll(req.Body)
     if err != nil ||  len(body) != 337 {
@@ -581,7 +633,7 @@ func (hc *httpIface) tokenHandler(w http.ResponseWriter, req *http.Request) {
     access := hc.rep(string(body[28:60]))
     tokenData := ""
 
-    if item, err := hc.Cache.Get(access); (err != nil) && (item != nil) {
+    if item, err := hc.Cache.Get(access); (err == nil) && (item != nil) {
         tokenData = string(item.Value)
     } else {
         data, err := hc.PC.ObjectGetProp(project, user)
@@ -613,4 +665,5 @@ func (hc *httpIface) tokenHandler(w http.ResponseWriter, req *http.Request) {
         return
     }
     fmt.Fprintf(w, respTpl, project, project, user)
+    hc.bumpMetric(hc.Metrics.RqData)
 }
