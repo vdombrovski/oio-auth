@@ -3,16 +3,9 @@ package keystore
 import (
 	"crypto/aes"
 	"crypto/rand"
-	"crypto/rsa"
-	"crypto/sha256"
 	"crypto/cipher"
 	"encoding/base64"
-	"os"
 	"io"
-	"io/ioutil"
-    "crypto/x509"
-    "encoding/pem"
-    "errors"
 )
 
 type KeyStore interface {
@@ -20,26 +13,8 @@ type KeyStore interface {
 	Decrypt(data string) (string, error)
 }
 
-type PlainStore struct {
-}
 type AESStore struct {
 	key *[]byte
-}
-
-type RSAStore struct {
-	key *rsa.PrivateKey
-}
-
-func MakePlainStore(path, pwd string) (*PlainStore) {
-	return &PlainStore{}
-}
-
-func (ks *PlainStore) Encrypt(msg string) (string, error) {
-	return msg, nil
-}
-
-func (ks *PlainStore) Decrypt(msg string) (string, error) {
-	return msg, nil
 }
 
 func MakeAESStore(path, pwd string) (*AESStore) {
@@ -95,60 +70,4 @@ func (ks *AESStore) Decrypt(msg string) (string, error) {
 	}
 
 	return string(plain), nil
-}
-
-func MakeRSAStore(path, pwd string) (*RSAStore, error){
-	key, err := loadPrivKey(path, pwd)
-	if err != nil {
-		return nil, err
-	}
-	return &RSAStore{key: key}, nil
-}
-
-func (ks *RSAStore) Encrypt(msg string) (string, error) {
-	rng := rand.Reader
-	ct, err := rsa.EncryptOAEP(sha256.New(), rng, &ks.key.PublicKey, []byte(msg), []byte{})
-	if err != nil {
-		return "", err
-	}
-    return base64.StdEncoding.EncodeToString(ct), nil
-}
-
-func (ks *RSAStore) Decrypt(data string) (string, error) {
-	ciphertext, _ := base64.StdEncoding.DecodeString(data)
-	rng := rand.Reader
-	msg, err := rsa.DecryptOAEP(sha256.New(), rng, ks.key, ciphertext, []byte{})
-	if err != nil {
-		return "", err
-	}
-	return string(msg), nil
-}
-
-func loadPrivKey(filename string, pwd string) (*rsa.PrivateKey, error) {
-	file, err := os.Open(filename)
-    if err != nil {
-        return nil, err
-    }
-    defer file.Close()
-
-	data, err := ioutil.ReadAll(file)
-    if err != nil {
-		return nil, err
-	}
-
-	block, _ := pem.Decode(data)
-
-	if block == nil || block.Type != "RSA PRIVATE KEY" {
-        return nil, errors.New("failed to decode PEM block")
-	}
-
-    bytes, err := x509.DecryptPEMBlock(block, []byte(pwd))
-    if err != nil {
-        return nil, err
-	}
-	privKey, err := x509.ParsePKCS1PrivateKey(bytes)
-	if err != nil {
-        return nil, err
-	}
-    return privKey, nil
 }

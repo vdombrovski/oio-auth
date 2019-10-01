@@ -66,6 +66,7 @@ type metrics struct {
 
 type httpIface struct {
     PC oio.Proxy
+    AC oio.Account
     KS keystore.KeyStore
     Cache cache
     Metrics metrics
@@ -77,10 +78,10 @@ func makeHTTPIface() *httpIface {
     // if err != nil {
     //     log.Fatal(err)
     // }
-    ks := keystore.MakeAESStore("", "passphrase")
     return &httpIface{
         PC: oio.MakeProxyClient("http://10.10.10.11:6006", "OPENIO"),
-        KS: ks,
+        AC: oio.MakeAccountClient("http://10.10.10.11:6009", "OPENIO"),
+        KS: keystore.MakeAESStore("", "xo3ogaiFaishee1nooJoh5quiehi0aib"),
         Cache: memcache.New("10.10.10.11:6019", "10.10.10.12:6019", "10.10.10.13:6019"),
         Metrics: metrics{
             RtData: new(int64),
@@ -98,13 +99,17 @@ func makeHTTPIface() *httpIface {
 func main() {
     hc := makeHTTPIface()
 
+    enc, err := hc.KS.Encrypt("root")
+    if err != nil {
+        log.Fatal(err)
+    }
     // Bootstrap default root user
-    hc.PC.ContainerCreate(hc.rep("root"))
-    hc.PC.ObjectCreate(hc.rep("root"), hc.rep("root"))
-    hc.PC.ObjectSetProp(hc.rep("root"), hc.rep("root"), map[string]string{"pwd": hc.hashPassword("root")})
-    hc.addIndex("name", "root", "projects")
-    hc.addIndex("root", "root/root/admin", "users")
-
+    hc.PC.ContainerCreate(hc.rep("root"), map[string]string{"self": enc})
+    enc, _ = hc.KS.Encrypt("root/root/admin")
+    hc.PC.ObjectCreate(hc.rep("root"), hc.rep("root"), map[string]string{
+        "pwd": hc.hashPassword("root"),
+        "self": enc,
+    })
     // Administration interface
     http.HandleFunc("/api/v1/auth", hc.authHandler)
     http.HandleFunc("/api/v1/users", hc.userHandler)
@@ -198,26 +203,6 @@ func (hc *httpIface) hashPassword(pwd string) string {
 	return base64.StdEncoding.EncodeToString(pbkdf2.Key([]byte(pwd), seed, 10000, 50, sha256.New))
 }
 
-func (hc *httpIface) addIndex(key, value, t string) error {
-    data := key + ":" + value
-    enc, err := hc.KS.Encrypt(data)
-    if err != nil {
-        // Something wrong with encryption layer
-        return err
-    }
-
-    // TODO: consider doing this at init
-    _ = hc.PC.ContainerCreate("self")
-    _ = hc.PC.ObjectCreate("self", t)
-    return hc.PC.ObjectSetProp("self", t, map[string]string{
-        hc.rep(data): enc,
-    })
-}
-
-func (hc *httpIface) delIndex(index, t string) error {
-    return hc.PC.ObjectDelProp("self", t, hc.rep(index))
-}
-
 func (hc *httpIface) rep(entity string) string {
     return hex.EncodeToString(util.SignSHA256(seed, []byte(entity)))[:8]
 }
@@ -256,51 +241,24 @@ func (hc *httpIface) authHandler(w http.ResponseWriter, req *http.Request) {
             ph := ""
             u := user{Project: &ph}
             hc.decodeJSON(req, &u)
-            if u.Project == nil || u.User == nil || u.Password == nil  {
-                w.WriteHeader(http.StatusForbidden)
+            if u.Project == nil || u.User == nil || u.Password == nil {
+                // ERR: user, project and password required
+                w.WriteHeader(http.StatusBadRequest)
                 return
             }
             props, err := hc.PC.ObjectGetProp(hc.rep(*u.Project), hc.rep(*u.User))
             if err != nil {
-                // TODO: 503
-                w.WriteHeader(http.StatusBadRequest)
-                return
-            }
-            // TODO: maybe move role to user data to avoid having to perform this request
-            role := ""
-            userIndex, _ := hc.PC.ObjectGetProp("self", "users")
-            for _, data := range userIndex {
-                _, usrDataStr, _ := hc.decodeKeyPair(data)
-                usrData := strings.Split(usrDataStr, "/")
-                if len(usrData) != 3 {
-                    fmt.Println(usrData)
-                    continue
-                }
-                if usrData[1] == *u.User {
-                    role = usrData[2]
-                    break
-                }
-            }
-            if role == "" {
-                // TODO: 503, this role should always be defined
-                w.WriteHeader(http.StatusBadRequest)
+                // ERR: BACKEND ERROR
+                w.WriteHeader(http.StatusServiceUnavailable)
                 return
             }
 
             if pwd, ok := props["pwd"]; ok {
-                if hc.hashPassword(*u.Password) == pwd {
+                if cipher, ok := props["self"]; ok && hc.hashPassword(*u.Password) == pwd {
                     rand.Seed(time.Now().UnixNano())
                     token := make([]byte, 256)
                     rand.Read(token)
                     tokenStr := base64.StdEncoding.EncodeToString(token)[:32]
-                    // TODO: encryption
-                    cipher, err := hc.KS.Encrypt(*u.Project + "/" + *u.User + "/" + role)
-                    if err != nil {
-                        // Encryption layer error
-                        // TODO: 503
-                        w.WriteHeader(http.StatusBadRequest)
-                        return
-                    }
                     hc.Cache.Set(&memcache.Item{
                         Key: tokenStr,
                         Value: []byte(cipher),
@@ -326,14 +284,30 @@ func (hc *httpIface) projectHandler(w http.ResponseWriter, req *http.Request) {
                 return
             }
             projects := []project{}
-            props, _ := hc.PC.ObjectGetProp("self", "projects")
-            for _, data := range props {
-                _, proj, err := hc.decodeKeyPair(data)
+            containers, err := hc.AC.ContainerList()
+            if err != nil {
+                // TODO: 503, account backend error
+                fmt.Println(err)
+                w.WriteHeader(http.StatusServiceUnavailable)
+                return
+            }
+            for _, cnt := range(containers) {
+                props, err := hc.PC.ContainerGetProps(cnt)
                 if err != nil {
-                    // Invalid project encryption format, ignore it
+                    // TODO: log error with container
                     continue
                 }
-                projects = append(projects, project{Project: &proj})
+                if nameEnc, ok := props["self"]; ok {
+                    proj, err := hc.KS.Decrypt(nameEnc)
+                    if err != nil {
+                        // Invalid project encryption format, ignore it
+                        continue
+                    }
+                    projects = append(projects, project{Project: &proj})
+                } else {
+                    // TODO: Log integrity error: project without name
+                    continue
+                }
             }
             res, _ := json.Marshal(projects)
             fmt.Fprintf(w, string(res))
@@ -357,14 +331,11 @@ func (hc *httpIface) projectHandler(w http.ResponseWriter, req *http.Request) {
                 return
             }
 
-            err = hc.addIndex("name", *p.Project, "projects")
-            if err != nil {
-                // Something wrong with indexing layer
-                w.WriteHeader(http.StatusBadRequest)
-                return
-            }
-
-            _ = hc.PC.ContainerCreate(hc.rep(*p.Project))
+            // TODO: handle these errorss
+            enc, _ := hc.KS.Encrypt(*p.Project)
+            _ = hc.PC.ContainerCreate(hc.rep(*p.Project), map[string]string{
+                "self": enc,
+            })
         case "DELETE":
             ph := ""
             p := project{Project: &ph}
@@ -381,13 +352,7 @@ func (hc *httpIface) projectHandler(w http.ResponseWriter, req *http.Request) {
                 return
             }
 
-            // TODO: ROLLBACK if one of the operations fails
             err := hc.PC.ContainerDel(hc.rep(*p.Project))
-            if err != nil {
-                w.WriteHeader(http.StatusBadRequest)
-                return
-            }
-            err = hc.delIndex(*p.Project, "projects")
             if err != nil {
                 w.WriteHeader(http.StatusBadRequest)
                 return
@@ -416,20 +381,20 @@ func (hc *httpIface) userHandler(w http.ResponseWriter, req *http.Request) {
             }
 
             users := []user{}
-            props, _ := hc.PC.ObjectGetProp("self", "users")
-            for _, data := range props {
-                proj, usrDataStr, err := hc.decodeKeyPair(data)
-                usrData := strings.Split(usrDataStr, "/")
-                if len(usrData) != 2 {
-                    // Invalid user role encoding format, ignore it
-                    continue
-                }
-                if err != nil {
-                    // Invalid project encryption format, ignore it
-                    continue
-                }
-                if proj == *p.Project {
-                    users = append(users, user{User: &usrData[0], Role: &usrData[1]})
+            objects, _ := hc.PC.ObjectList(hc.rep(*p.Project), true)
+            for _, obj := range objects {
+                if usrStr, ok := obj.Properties["self"]; ok {
+                    decr, err := hc.KS.Decrypt(usrStr)
+                    if err != nil {
+                        // Encryption backend error, continue
+                        continue
+                    }
+                    usrData := strings.Split(decr, "/")
+                    if len(usrData) != 3 {
+                        // Invalid userdata encoding
+                        continue
+                    }
+                    users = append(users, user{User: &usrData[1], Role: &usrData[2]})
                 }
             }
             res, _ := json.Marshal(users)
@@ -439,8 +404,7 @@ func (hc *httpIface) userHandler(w http.ResponseWriter, req *http.Request) {
             u := user{Project: &ph}
             hc.decodeJSON(req, &u)
             if u.Project == nil || u.User == nil || u.Password == nil  {
-                // MISSING PROJECT
-                log.Println("missing project")
+                // ERR: MISSING PROJECT/User/Password
                 w.WriteHeader(http.StatusBadRequest)
                 return
             }
@@ -451,20 +415,15 @@ func (hc *httpIface) userHandler(w http.ResponseWriter, req *http.Request) {
                 return
             }
 
-            role := "member"
-            if u.Role != nil {
-                role = *u.Role
+            if u.Role == nil {
+                *u.Role = "member"
             }
             // TODO: return 409 on error
-            hc.PC.ObjectCreate(hc.rep(*u.Project), hc.rep(*u.User))
-            err := hc.addIndex(*u.Project, *u.User + "/" + role, "users")
-            if err != nil {
-                // Something wrong with indexing layer
-                w.WriteHeader(http.StatusBadRequest)
-                return
-            }
-            // TODO: can this be directly done at object creation?
-            hc.PC.ObjectSetProp(hc.rep(*u.Project), hc.rep(*u.User), map[string]string{
+
+            enc, _ := hc.KS.Encrypt(*u.Project + "/" + *u.User + "/" + *u.Role)
+
+            hc.PC.ObjectCreate(hc.rep(*u.Project), hc.rep(*u.User), map[string]string{
+                "self": enc,
                 "pwd": hc.hashPassword(*u.Password),
             })
         case "PUT":
@@ -508,11 +467,11 @@ func (hc *httpIface) userHandler(w http.ResponseWriter, req *http.Request) {
                 w.WriteHeader(http.StatusBadRequest)
                 return
             }
-            err = hc.delIndex(*u.User, "users")
-            if err != nil {
-                w.WriteHeader(http.StatusBadRequest)
-                return
-            }
+            // err = hc.delIndex(*u.User, "users")
+            // if err != nil {
+            //     w.WriteHeader(http.StatusBadRequest)
+            //     return
+            // }
     }
 }
 
@@ -630,7 +589,7 @@ func (hc *httpIface) tokenHandler(w http.ResponseWriter, req *http.Request) {
 
     project := string(body[36:44])
     user := string(body[44:52])
-    access := hc.rep(string(body[28:60]))
+    access := string(body[28:60])
     tokenData := ""
 
     if item, err := hc.Cache.Get(access); (err == nil) && (item != nil) {
@@ -643,7 +602,7 @@ func (hc *httpIface) tokenHandler(w http.ResponseWriter, req *http.Request) {
             w.WriteHeader(http.StatusForbidden)
             return
         }
-        if token, ok := data[access]; ok {
+        if token, ok := data[hc.rep(access)]; ok {
             tokenData = token
             hc.Cache.Set(&memcache.Item{Key: access, Value: []byte(tokenData)})
         } else {

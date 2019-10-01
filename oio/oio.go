@@ -11,9 +11,10 @@ import (
 )
 
 type Proxy interface {
-    ContainerCreate(container string) error
+    ContainerCreate(container string, props map[string]string) error
     ContainerDel(container string) error
-    ObjectCreate(container, object string) error
+    ContainerGetProps(container string) (map[string]string, error)
+    ObjectCreate(container, object string, props map[string]string) error
     ObjectDel(container, object string) error
     ObjectDelProp(container, object string, prop string) error
     ObjectGetProp(container, object string) (map[string]string, error)
@@ -21,8 +22,12 @@ type Proxy interface {
     ObjectSetProp(container, object string, props map[string]string) error
 }
 
-type ProxyClient struct {
-    proxyURL string
+type Account interface {
+    ContainerList() ([]string, error)
+}
+
+type Client struct {
+    URL string
 }
 
 type chunk struct {
@@ -32,6 +37,14 @@ type chunk struct {
     Pos string `json:"pos"`
     Size int64 `json:"size"`
     Score int64 `json:"score"`
+}
+
+type containerList struct {
+    Listing [][]interface{} `json:"listing"`
+}
+
+type containerProps struct {
+    Properties map[string]string `json:"properties"`
 }
 
 type objectList struct {
@@ -45,20 +58,43 @@ type Object struct {
 
 const globalAcct = "IAM"
 
-func MakeProxyClient(url, ns string) *ProxyClient {
-    return &ProxyClient{
-        proxyURL: url + "/v3.0/" + ns + "/",
+func MakeProxyClient(url, ns string) *Client {
+    return &Client{
+        URL: url + "/v3.0/" + ns + "/",
     }
 }
 
-func(pc *ProxyClient) http(method, url, data string, hdrs, params map[string]string) ([]byte, error) {
+func MakeAccountClient(url, ns string) *Client {
+    return &Client{
+        URL: url + "/v1.0/account/",
+    }
+}
+
+func (ac *Client) ContainerList() ([]string, error) {
+    data, err := ac.http("GET", "containers", "", nil, map[string]string{"id": globalAcct})
+    if err != nil {
+        return nil, err
+    }
+    containers := []string{}
+    cntList := containerList{}
+    err = json.Unmarshal(data, &cntList)
+    if err != nil {
+        return nil, err
+    }
+    for _, c := range(cntList.Listing) {
+        containers = append(containers, c[0].(string))
+    }
+    return containers, nil
+}
+
+func(pc *Client) http(method, url, data string, hdrs, params map[string]string) ([]byte, error) {
     client := &http.Client{}
     paramStr := "?"
     for k, v := range(params) {
         paramStr += k + "=" + v + "&"
     }
     if !strings.HasPrefix(url, "http") {
-        url = pc.proxyURL + url
+        url = pc.URL + url
     }
 
     req, _ := http.NewRequest(
@@ -79,7 +115,11 @@ func(pc *ProxyClient) http(method, url, data string, hdrs, params map[string]str
     return body, nil
 }
 
-func(pc *ProxyClient) ObjectCreate(container, object string) error {
+func(pc *Client) ObjectCreate(container, object string, props map[string]string) error {
+    properties, err := json.Marshal(props)
+    if err != nil {
+        return err
+    }
     chunkData, err := pc.http("POST", "content/prepare", "{\"size\":0}", map[string]string{}, pc.path(container, object))
     if err != nil {
         return err
@@ -93,7 +133,7 @@ func(pc *ProxyClient) ObjectCreate(container, object string) error {
     for _, c := range chunks {
         _, err = pc.http("PUT", c.URL, "", map[string]string{
             "X-oio-chunk-meta-full-path": "IAM/" + container + "/" + object + "/1/00000000000000000000000000000000",
-            "X-oio-chunk-meta-content-storage-policy": "THREECOPIES",
+            "X-oio-chunk-meta-content-storage-policy": "THREECOPIES", // TODO: configurable policy
             "X-oio-chunk-meta-content-chunk-method": "plain/distance=1,nb_copy=3",
             "X-oio-chunk-meta-chunk-pos": "0",
         }, nil)
@@ -103,7 +143,9 @@ func(pc *ProxyClient) ObjectCreate(container, object string) error {
         }
     }
 
-    _, err = pc.http("POST", "content/create", string(chunkData), map[string]string{
+    data := "{\"chunks\":" + string(chunkData) + ",\"properties\": " + string(properties) + "}"
+
+    _, err = pc.http("POST", "content/create", data, map[string]string{
         "x-oio-content-meta-length": "0",
         "x-oio-content-meta-policy": "THREECOPIES",
         "x-oio-content-meta-version": "1",
@@ -112,7 +154,7 @@ func(pc *ProxyClient) ObjectCreate(container, object string) error {
     return err
 }
 
-func(pc *ProxyClient) ObjectDel(container, object string) error {
+func(pc *Client) ObjectDel(container, object string) error {
     _, err := pc.http("POST", "content/delete", "", nil, map[string]string{
         "acct": globalAcct,
         "ref": container,
@@ -121,11 +163,11 @@ func(pc *ProxyClient) ObjectDel(container, object string) error {
     return err
 }
 
-func (pc *ProxyClient) path(container, object string) map[string]string {
+func (pc *Client) path(container, object string) map[string]string {
     return map[string]string{"acct": globalAcct, "ref": container, "path": object}
 }
 
-func(pc *ProxyClient) ObjectGetProp(container, object string) (map[string]string, error) {
+func(pc *Client) ObjectGetProp(container, object string) (map[string]string, error) {
     // TODO
     var res map[string]string
     body, err := pc.http("POST", "content/get_properties", "", nil, pc.path(container, object))
@@ -139,7 +181,7 @@ func(pc *ProxyClient) ObjectGetProp(container, object string) (map[string]string
     return res, nil
 }
 
-func(pc *ProxyClient) ObjectSetProp(container, object string, props map[string]string) error {
+func(pc *Client) ObjectSetProp(container, object string, props map[string]string) error {
     // data=json.dumps({"properties": {"219021921020129121902":"32932039289328303290"}}))
     propsData, err := json.Marshal(props)
     if err != nil {
@@ -150,21 +192,42 @@ func(pc *ProxyClient) ObjectSetProp(container, object string, props map[string]s
     return nil
 }
 
-func(pc *ProxyClient) ObjectDelProp(container, object string, prop string) error {
+func(pc *Client) ObjectDelProp(container, object string, prop string) error {
     _, err := pc.http("POST", "content/del_properties", "[\"" + prop + "\"]", nil,
                     pc.path(container, object))
     return err
 }
 
-func(pc *ProxyClient) ContainerCreate(container string) error {
-    _, err := pc.http("POST", "container/create", "", nil, map[string]string{
+func(pc *Client) ContainerCreate(container string, props map[string]string) error {
+    properties, err := json.Marshal(props)
+    if err != nil {
+        return err
+    }
+    data := "{\"properties\": " + string(properties) +"}"
+    _, err = pc.http("POST", "container/create", data, nil, map[string]string{
         "acct": globalAcct,
         "ref": container,
     })
     return err
 }
 
-func(pc *ProxyClient) ObjectList(container string, props bool) ([]Object, error) {
+func (pc *Client) ContainerGetProps(container string) (map[string]string, error) {
+    props := containerProps{}
+    res, err := pc.http("POST", "container/get_properties", "", nil, map[string]string{
+        "acct": globalAcct,
+        "ref": container,
+    })
+    if err != nil {
+        return nil, err
+    }
+    err = json.Unmarshal(res, &props)
+    if err != nil {
+        return nil, err
+    }
+    return props.Properties, nil
+}
+
+func(pc *Client) ObjectList(container string, props bool) ([]Object, error) {
     doProps := "false"
     if props {
         doProps = "true"
@@ -184,7 +247,7 @@ func(pc *ProxyClient) ObjectList(container string, props bool) ([]Object, error)
     return objList.Objects, err
 }
 
-func(pc *ProxyClient) ContainerDel(container string) error {
+func(pc *Client) ContainerDel(container string) error {
     objects, err := pc.ObjectList(container, false)
     if err != nil {
         return err
