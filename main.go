@@ -10,15 +10,18 @@ import (
     "encoding/hex"
     "fmt"
     "log"
+    "flag"
+    "os"
     "encoding/json"
     "math/rand"
     "time"
     "errors"
-    "oioiam/oio"
-    "oioiam/keystore"
-    "oioiam/util"
+    "kortech.de/oio-iam/oio"
+    "kortech.de/oio-iam/keystore"
+    "kortech.de/oio-iam/util"
     "golang.org/x/crypto/pbkdf2"
     "github.com/bradfitz/gomemcache/memcache"
+    "gopkg.in/yaml.v3"
 )
 
 var seed = []byte("changeme")
@@ -72,17 +75,36 @@ type httpIface struct {
     Metrics metrics
 }
 
-func makeHTTPIface() *httpIface {
-    // openssl genrsa -des3 -out private.pem 2048
-    // ks, err := keystore.RSAKeystore("/tmp/private.pem", "testytest")
-    // if err != nil {
-    //     log.Fatal(err)
-    // }
-    return &httpIface{
-        PC: oio.MakeProxyClient("http://10.10.10.11:6006", "OPENIO"),
-        AC: oio.MakeAccountClient("http://10.10.10.11:6009", "OPENIO"),
-        KS: keystore.MakeAESStore("", "xo3ogaiFaishee1nooJoh5quiehi0aib"),
-        Cache: memcache.New("10.10.10.11:6019", "10.10.10.12:6019", "10.10.10.13:6019"),
+type LocalCache struct {
+    Cache map[string]*memcache.Item
+}
+
+func MakeLocalCache() *LocalCache {
+    return &LocalCache{Cache: map[string]*memcache.Item{}}
+}
+
+func (lc *LocalCache) Get(key string) (*memcache.Item, error) {
+    if item, ok := lc.Cache[key]; ok {
+        return item, nil
+    }
+    return nil, errors.New("No such key")
+}
+
+func (lc *LocalCache) Set(item *memcache.Item) error {
+    lc.Cache[item.Key] = item
+    return nil
+}
+
+func (lc *LocalCache) Touch(key string, seconds int32) error {
+    // NOOP here
+    return nil
+}
+
+
+func makeHTTPIface(conf Configuration) *httpIface {
+    iface := httpIface{
+        PC: oio.MakeProxyClient(conf.Backend.ProxyURL, conf.Backend.Namespace),
+        AC: oio.MakeAccountClient(conf.Backend.AccountURL, conf.Backend.Namespace),
         Metrics: metrics{
             RtData: new(int64),
             RtAdmin: new(int64),
@@ -94,35 +116,34 @@ func makeHTTPIface() *httpIface {
             RqAdmin: new(int64),
         },
     }
-}
-
-func main() {
-    hc := makeHTTPIface()
-
-    enc, err := hc.KS.Encrypt("root")
-    if err != nil {
-        log.Fatal(err)
+    
+    if conf.Encryption.Type == "AES" {
+        if len(conf.Encryption.AESKey) != 32 {
+            log.Fatalln("FATAL: AES key needs to be 32 bytes")
+        }
+        iface.KS = keystore.MakeAESStore("", conf.Encryption.AESKey)
+    /* } else if conf.Encryption.Type == "RSA" {
+        var err error
+        // openssl genrsa -des3 -out private.pem 2048
+        iface.KS, err = keystore.RSAKeystore(conf.Encryption.RSAKeyFile, conf.Encryption.RSAKeyPassword)
+        if err != nil {
+            log.Fatal(err)
+        }
+    */
+    } else {
+        log.Fatalln("FATAL: Invalid encryption type, must be in AES")
     }
-    // Bootstrap default root user
-    hc.PC.ContainerCreate(hc.rep("root"), map[string]string{"self": enc})
-    enc, _ = hc.KS.Encrypt("root/root/admin")
-    hc.PC.ObjectCreate(hc.rep("root"), hc.rep("root"), map[string]string{
-        "pwd": hc.hashPassword("root"),
-        "self": enc,
-    })
-    // Administration interface
-    http.HandleFunc("/api/v1/auth", hc.authHandler)
-    http.HandleFunc("/api/v1/users", hc.userHandler)
-    http.HandleFunc("/api/v1/projects", hc.projectHandler)
-    http.HandleFunc("/api/v1/keys", hc.keyHandler)
-    // Multi-cluster sync interface
-    http.HandleFunc("/api/v1/sync", hc.cacheSyncHandler)
-    // Monitoring
-    http.HandleFunc("/api/v1/metrics", hc.metricHandler)
-    // Token validation interface
-    http.HandleFunc("/", hc.miscHandler)
-    http.HandleFunc("/v2.0/s3tokens", hc.tokenHandler)
-    http.ListenAndServe(":8080", nil)
+    
+    if conf.Cache.Enabled {
+        if len(conf.Cache.Servers) < 1 {
+            log.Fatalln("FATAL: memcached cache is enabled but no servers were provided")
+        }
+        iface.Cache = memcache.New(conf.Cache.Servers...)
+    } else {
+        iface.Cache = MakeLocalCache()
+    }
+    
+    return &iface
 }
 
 func (hc *httpIface) decodeJSON(req *http.Request, into interface{}) error {
@@ -331,7 +352,7 @@ func (hc *httpIface) projectHandler(w http.ResponseWriter, req *http.Request) {
                 return
             }
 
-            // TODO: handle these errorss
+            // TODO: handle these errors
             enc, _ := hc.KS.Encrypt(*p.Project)
             _ = hc.PC.ContainerCreate(hc.rep(*p.Project), map[string]string{
                 "self": enc,
@@ -625,4 +646,96 @@ func (hc *httpIface) tokenHandler(w http.ResponseWriter, req *http.Request) {
     }
     fmt.Fprintf(w, respTpl, project, project, user)
     hc.bumpMetric(hc.Metrics.RqData)
+}
+
+type Configuration struct {
+    Server struct {
+        IP string `yaml:"ip"`
+        Port uint `yaml:"port"`
+    } `yaml:"server"`
+    Backend struct {
+        Namespace string `yaml:"namespace"`
+        AccountURL string `yaml:"account_url"`
+        ProxyURL string `yaml:"proxy_url"`
+    } `yaml:"backend"`
+    Cache struct {
+        Enabled bool `yaml:"enabled"`
+        Servers []string `yaml:"servers"`
+    } `yaml:"cache"`
+    Encryption struct {
+        Type string `yaml:"type"`
+        AESKey string `yaml:"aes_key"`
+        // RSAKeyFile string `yaml:"rsa_key_file"`
+        // RSAKeyPassword string `yaml:"rsa_key_pass"`
+    } `yaml:"encryption"`
+}
+
+func readConfig(confFile string) (Configuration, error) {
+    conf := Configuration{}
+    conf.Server.IP = "localhost"
+    conf.Server.Port = 8080
+    conf.Backend.Namespace = "OPENIO"
+    conf.Backend.AccountURL = "http:/localhost:6009"
+    conf.Backend.ProxyURL = "http:/localhost:6006"
+    conf.Cache.Enabled = false
+    conf.Encryption.Type = "AES"
+    conf.Encryption.AESKey = "youneedtochangemeasoonaspossible"
+    
+    if confFile == "" {
+        log.Println("No default configuration file provided; using defaults")
+        return conf, nil
+    }
+    
+    f, err := os.Open(confFile)
+    if err != nil {
+        return conf, err
+    }
+    
+    if err := yaml.NewDecoder(f).Decode(&conf); err != nil {
+        return conf, err
+    }
+    return conf, nil
+}
+
+func main() {
+    confFile := flag.String("config", "", "Path to configuration file")
+    flag.Parse()
+    
+    conf, err := readConfig(*confFile)
+    if err != nil {
+        log.Fatalln(err)
+    }
+    
+    hc := makeHTTPIface(conf)
+
+    enc, err := hc.KS.Encrypt("root")
+    if err != nil {
+        log.Fatal(err)
+    }
+    
+    // Bootstrap default root user if it doesn't exist
+    if _, err := hc.PC.ContainerGetProps(hc.rep("root")); err != nil {
+        if err := hc.PC.ContainerCreate(hc.rep("root"), map[string]string{"self": enc}); err != nil {
+            log.Fatalln("FATAL: failed to init account:", err)
+        }
+        enc, _ = hc.KS.Encrypt("root/root/admin")
+        hc.PC.ObjectCreate(hc.rep("root"), hc.rep("root"), map[string]string{
+            "pwd": hc.hashPassword("root"),
+            "self": enc,
+        })
+    }
+    
+    // Administration interface
+    http.HandleFunc("/api/v1/auth", hc.authHandler)
+    http.HandleFunc("/api/v1/users", hc.userHandler)
+    http.HandleFunc("/api/v1/projects", hc.projectHandler)
+    http.HandleFunc("/api/v1/keys", hc.keyHandler)
+    // Multi-cluster sync interface
+    http.HandleFunc("/api/v1/sync", hc.cacheSyncHandler)
+    // Monitoring
+    http.HandleFunc("/api/v1/metrics", hc.metricHandler)
+    // Token validation interface
+    http.HandleFunc("/", hc.miscHandler)
+    http.HandleFunc("/v2.0/s3tokens", hc.tokenHandler)
+    http.ListenAndServe(fmt.Sprintf("%s:%d", conf.Server.IP, conf.Server.Port), nil)
 }

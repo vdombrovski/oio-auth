@@ -11,6 +11,7 @@ import(
 )
 
 var acVersion = "1"
+const PREFIX = "oio"
 
 func NewToken(projRep, usrRep string) (string, string) {
     // TOKEN SPEC:
@@ -34,7 +35,7 @@ func NewToken(projRep, usrRep string) (string, string) {
     rand.Read(rand1)
     rand.Read(rand2)
     rand.Read(secret)
-    return "oio" + acVersion + hex.EncodeToString(rand1)[:4] + projRep + usrRep + hex.EncodeToString(rand2)[:8],
+    return PREFIX + acVersion + hex.EncodeToString(rand1)[:4] + projRep + usrRep + hex.EncodeToString(rand2)[:8],
         hex.EncodeToString(secret)[:32]
 }
 

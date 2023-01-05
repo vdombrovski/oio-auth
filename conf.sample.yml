@@ -1,0 +1,14 @@
+server:
+  ip: localhost
+  port: 8080
+backend:
+  namespace: OPENIO
+  account_url: "http:/localhost:6009"
+  proxy_url: "http:/localhost:6006"
+cache:
+  enabled: false
+  servers: []
+encryption:
+  type: AES
+  aes_key: "youneedtochangemeasoonaspossible"
+    

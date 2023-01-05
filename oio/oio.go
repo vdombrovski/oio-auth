@@ -103,6 +103,9 @@ func(pc *Client) http(method, url, data string, hdrs, params map[string]string) 
         req.Header.Add(k, v)
     }
     resp, err := client.Do(req)
+    if err != nil {
+        return nil, err
+    }
     defer resp.Body.Close()
     body, _ := ioutil.ReadAll(resp.Body)
     if err != nil {
