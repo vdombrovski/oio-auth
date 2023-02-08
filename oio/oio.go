@@ -8,7 +8,12 @@ import (
     "io/ioutil"
     "encoding/json"
     "strings"
+    "fmt"
+    "log"
 )
+
+const bucketPolicy = "{\"Statement\": [{\"Action\": [\"s3:*\"], \"Effect\": \"Allow\", \"Resource\": [\"*\"], \"Sid\": \"FullAccess\"}]}"
+const accountPrefix = "AUTH_"
 
 type Proxy interface {
     ContainerCreate(container string, props map[string]string) error
@@ -24,6 +29,8 @@ type Proxy interface {
 
 type Account interface {
     ContainerList() ([]string, error)
+    PolicyCreateDefault(project, user string) (error)
+    PolicyDelete(project, user string) (error)
 }
 
 type Client struct {
@@ -44,6 +51,7 @@ type containerList struct {
 }
 
 type containerProps struct {
+    Status int `json:"status"`
     Properties map[string]string `json:"properties"`
 }
 
@@ -66,12 +74,12 @@ func MakeProxyClient(url, ns string) *Client {
 
 func MakeAccountClient(url, ns string) *Client {
     return &Client{
-        URL: url + "/v1.0/account/",
+        URL: url + "/v1.0/",
     }
 }
 
 func (ac *Client) ContainerList() ([]string, error) {
-    data, err := ac.http("GET", "containers", "", nil, map[string]string{"id": globalAcct})
+    data, err := ac.http("GET", "account/containers", "", nil, map[string]string{"id": globalAcct})
     if err != nil {
         return nil, err
     }
@@ -85,6 +93,25 @@ func (ac *Client) ContainerList() ([]string, error) {
         containers = append(containers, c[0].(string))
     }
     return containers, nil
+}
+
+
+func (ac *Client) PolicyCreateDefault(project, user string) (error) {
+    params := map[string]string{
+        "user": fmt.Sprintf("%s:%s", project, user), 
+        "account": fmt.Sprintf("%s%s", accountPrefix, project),
+    }
+    _, err := ac.http("PUT", "iam/put-user-policy", bucketPolicy, nil, params)
+    return err
+}
+
+func (ac *Client) PolicyDelete(project, user string) (error) {
+    params := map[string]string{
+        "user": fmt.Sprintf("%s:%s", project, user), 
+        "account": fmt.Sprintf("%s%s", accountPrefix, project),
+    }
+    _, err := ac.http("DELETE", "iam/delete-user-policy", "", nil, params)
+    return err
 }
 
 func(pc *Client) http(method, url, data string, hdrs, params map[string]string) ([]byte, error) {
@@ -112,7 +139,7 @@ func(pc *Client) http(method, url, data string, hdrs, params map[string]string) 
         return body, err
     } else if resp.StatusCode / 100 == 5 {
         return body, errors.New("Internal server error")
-    } else if resp.StatusCode / 100 == 4 {
+    } else if resp.StatusCode / 100 == 4 && resp.StatusCode != 404 {
         return body, errors.New("Bad request")
     }
     return body, nil
@@ -220,6 +247,7 @@ func (pc *Client) ContainerGetProps(container string) (map[string]string, error)
         "acct": globalAcct,
         "ref": container,
     })
+
     if err != nil {
         return nil, err
     }
@@ -227,6 +255,10 @@ func (pc *Client) ContainerGetProps(container string) (map[string]string, error)
     if err != nil {
         return nil, err
     }
+    if props.Status == 406 || props.Status == 431 {
+        return nil, errors.New("Container not found")
+    }
+    
     return props.Properties, nil
 }
 
