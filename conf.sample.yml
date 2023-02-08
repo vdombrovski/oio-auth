@@ -7,7 +7,7 @@ backend:
   proxy_url: "http:/localhost:6006"
 cache:
   enabled: false
-  servers: []
+  servers: ""
 encryption:
   type: AES
   aes_key: "youneedtochangemeasoonaspossible"
