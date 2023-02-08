@@ -16,6 +16,7 @@ import (
     "math/rand"
     "time"
     "errors"
+    "regexp"
     "kortech.de/oio-iam/oio"
     "kortech.de/oio-iam/keystore"
     "kortech.de/oio-iam/util"
@@ -29,7 +30,7 @@ var tokenExpires = int32(86400)
 
 const respTpl = "{\"token\":{\"roles\":[]," +
 "\"project\":{\"domain\":{\"id\":\"\",\"name\":\"\"},\"id\":\"%s\",\"name\":\"%s\"}," +
-"\"user\":{\"domain\":{\"id\":\"\",\"name\":\"\"},\"id\":\"\",\"name\":\"%s\"}}}"
+"\"user\":{\"domain\":{\"id\":\"\",\"name\":\"\"},\"id\":\"%s\",\"name\":\"%s\"}}}"
 
 type project struct {
     Project *string `json:"project"`
@@ -138,7 +139,7 @@ func makeHTTPIface(conf Configuration) *httpIface {
         if len(conf.Cache.Servers) < 1 {
             log.Fatalln("FATAL: memcached cache is enabled but no servers were provided")
         }
-        iface.Cache = memcache.New(conf.Cache.Servers...)
+        iface.Cache = memcache.New(strings.Split(conf.Cache.Servers, ",")...)
     } else {
         iface.Cache = MakeLocalCache()
     }
@@ -246,16 +247,6 @@ func (hc *httpIface) metricHandler(w http.ResponseWriter, req *http.Request) {
     fmt.Fprintf(w, string(res))
 }
 
-func (hc *httpIface) cacheSyncHandler(w http.ResponseWriter, req *http.Request) {
-    fmt.Println("cache sync")
-}
-
-
-func (hc *httpIface) miscHandler(w http.ResponseWriter, req *http.Request) {
-    // TODO: NOT IMPLEMENTED
-    fmt.Println("test")
-}
-
 func (hc *httpIface) authHandler(w http.ResponseWriter, req *http.Request) {
     switch req.Method {
         case "POST":
@@ -341,7 +332,7 @@ func (hc *httpIface) projectHandler(w http.ResponseWriter, req *http.Request) {
                 fmt.Println(err)
             }
             if p.Project == nil {
-                // MISSING PROJECT
+                log.Println("Failed to create project; missing project")
                 w.WriteHeader(http.StatusBadRequest)
                 return
             }
@@ -349,6 +340,12 @@ func (hc *httpIface) projectHandler(w http.ResponseWriter, req *http.Request) {
             // RBAC: Only superusers can create projects
             if !hc.authorize("root", "", xAuthToken, true) {
                 w.WriteHeader(http.StatusForbidden)
+                return
+            }
+
+            if _, err := hc.PC.ContainerGetProps(hc.rep(*p.Project)); err == nil {
+                log.Println("Failed to create project: already exists", *p.Project)
+                w.WriteHeader(http.StatusConflict)
                 return
             }
 
@@ -425,7 +422,7 @@ func (hc *httpIface) userHandler(w http.ResponseWriter, req *http.Request) {
             u := user{Project: &ph}
             hc.decodeJSON(req, &u)
             if u.Project == nil || u.User == nil || u.Password == nil  {
-                // ERR: MISSING PROJECT/User/Password
+                log.Println("Failed to create user; missing project or user or password")
                 w.WriteHeader(http.StatusBadRequest)
                 return
             }
@@ -443,10 +440,22 @@ func (hc *httpIface) userHandler(w http.ResponseWriter, req *http.Request) {
 
             enc, _ := hc.KS.Encrypt(*u.Project + "/" + *u.User + "/" + *u.Role)
 
+            if _, err := hc.PC.ObjectGetProp(hc.rep(*u.Project), hc.rep(*u.User)); err == nil {
+                log.Println("Failed to create user: already exists", *u.Project, *u.User)
+                w.WriteHeader(http.StatusConflict)
+                return
+            }
+
             hc.PC.ObjectCreate(hc.rep(*u.Project), hc.rep(*u.User), map[string]string{
                 "self": enc,
                 "pwd": hc.hashPassword(*u.Password),
             })
+
+            if err := hc.AC.PolicyCreateDefault(*u.Project, *u.User); err != nil {
+                log.Println("User was created by policy failed, please check manually", *u.Project, *u.User, err)
+                w.WriteHeader(http.StatusInternalServerError)
+                return
+            }
         case "PUT":
             ph := ""
             u := user{Project: &ph}
@@ -482,17 +491,18 @@ func (hc *httpIface) userHandler(w http.ResponseWriter, req *http.Request) {
                 return
             }
 
+            if err := hc.AC.PolicyDelete(*u.Project, *u.User); err != nil {
+                log.Println("Policy delete failed, user was not deleted", *u.Project, *u.User, err)
+                w.WriteHeader(http.StatusInternalServerError)
+                return
+            }
+
             // TODO: implement rollback
             err := hc.PC.ObjectDel(hc.rep(*u.Project), hc.rep(*u.User))
             if err != nil {
                 w.WriteHeader(http.StatusBadRequest)
                 return
             }
-            // err = hc.delIndex(*u.User, "users")
-            // if err != nil {
-            //     w.WriteHeader(http.StatusBadRequest)
-            //     return
-            // }
     }
 }
 
@@ -527,8 +537,9 @@ func (hc *httpIface) keyHandler(w http.ResponseWriter, req *http.Request) {
                     // Invalid/corrupted key, log and continue
                     continue
                 }
+                accessFull := fmt.Sprintf("%s.%s.%s", *u.Project, *u.User, access)
                 res = append(res, key{
-                    Access: &access,
+                    Access: &accessFull,
                     Secret: &secret,
                 })
             }
@@ -568,10 +579,11 @@ func (hc *httpIface) keyHandler(w http.ResponseWriter, req *http.Request) {
                 w.WriteHeader(http.StatusBadRequest)
                 return
             }
+
+            accessFull := fmt.Sprintf("%s.%s.%s", *u.Project, *u.User, access)
+
             data, err := json.Marshal(key{
-                Project: u.Project,
-                User: u.User,
-                Access: &access,
+                Access: &accessFull,
                 Secret: &secret,
             })
             fmt.Fprintf(w, string(data))
@@ -599,24 +611,51 @@ func (hc *httpIface) keyHandler(w http.ResponseWriter, req *http.Request) {
     }
 }
 
+type Auth struct {
+    Credentials struct {
+        Access string `json:"access"`
+        Token string `json:"token"`
+        Signature string `json:"signature"`
+    } `json:"credentials"` 
+}
+
+func parseAccess(in string) (string, string, string, error) {
+    r := regexp.MustCompile(`(.*\w)\.(.*\w)\.(\w+)`)
+    matches := r.FindStringSubmatch(in)
+    if len(matches) != 4 {
+        return "", "", "", errors.New("Invalid access token format: " + in)
+    }
+    return matches[1], matches[2], matches[3], nil
+}
+
 func (hc *httpIface) tokenHandler(w http.ResponseWriter, req *http.Request) {
     defer hc.timeRequest(time.Now(), hc.Metrics.RtData, hc.Metrics.RqData)
-    defer req.Body.Close()
-    body, err := ioutil.ReadAll(req.Body)
-    if err != nil ||  len(body) != 337 {
+    if req.Method != "POST" {
+        w.WriteHeader(http.StatusMethodNotAllowed)
+        return
+    }
+    auth := Auth{}
+    if err := json.NewDecoder(req.Body).Decode(&auth); err != nil {
+        // TODO: log error
+        log.Println("ERROR when validating token", err)
         w.WriteHeader(http.StatusBadRequest)
         return
     }
 
-    project := string(body[36:44])
-    user := string(body[44:52])
-    access := string(body[28:60])
+    project, user, access, err := parseAccess(auth.Credentials.Access)
+    if err != nil {
+        // TODO: log error
+        log.Println("ERROR when validating token", err)
+        w.WriteHeader(http.StatusBadRequest)
+        return
+    }
+
     tokenData := ""
 
     if item, err := hc.Cache.Get(access); (err == nil) && (item != nil) {
         tokenData = string(item.Value)
     } else {
-        data, err := hc.PC.ObjectGetProp(project, user)
+        data, err := hc.PC.ObjectGetProp(hc.rep(project), hc.rep(user))
         if err != nil {
             // OIO backend error?
             // TODO: 503
@@ -631,20 +670,17 @@ func (hc *httpIface) tokenHandler(w http.ResponseWriter, req *http.Request) {
             return
         }
     }
-    // Note: Asymetric encryption might have a performance impact,
-    // consider switching to symmetric encryption for cache (AES256)
     _, secret, err := hc.decodeKeyPair(tokenData)
-
     if err != nil {
         // Invalid token
         w.WriteHeader(http.StatusForbidden)
         return
     }
-    if util.SignV4(string(body[73:253]), secret) != string(body[270:334]) {
+    if util.SignV4(auth.Credentials.Token, secret) != auth.Credentials.Signature {
         w.WriteHeader(http.StatusForbidden)
         return
     }
-    fmt.Fprintf(w, respTpl, project, project, user)
+    fmt.Fprintf(w, respTpl, project, project, user, user)
     hc.bumpMetric(hc.Metrics.RqData)
 }
 
@@ -660,7 +696,7 @@ type Configuration struct {
     } `yaml:"backend"`
     Cache struct {
         Enabled bool `yaml:"enabled"`
-        Servers []string `yaml:"servers"`
+        Servers string `yaml:"servers"`
     } `yaml:"cache"`
     Encryption struct {
         Type string `yaml:"type"`
@@ -715,6 +751,7 @@ func main() {
     
     // Bootstrap default root user if it doesn't exist
     if _, err := hc.PC.ContainerGetProps(hc.rep("root")); err != nil {
+        log.Println("Creating default root account")
         if err := hc.PC.ContainerCreate(hc.rep("root"), map[string]string{"self": enc}); err != nil {
             log.Fatalln("FATAL: failed to init account:", err)
         }
@@ -731,11 +768,8 @@ func main() {
     http.HandleFunc("/api/v1/projects", hc.projectHandler)
     http.HandleFunc("/api/v1/keys", hc.keyHandler)
     // Multi-cluster sync interface
-    http.HandleFunc("/api/v1/sync", hc.cacheSyncHandler)
     // Monitoring
     http.HandleFunc("/api/v1/metrics", hc.metricHandler)
-    // Token validation interface
-    http.HandleFunc("/", hc.miscHandler)
-    http.HandleFunc("/v2.0/s3tokens", hc.tokenHandler)
+    http.HandleFunc("/v3/s3tokens", hc.tokenHandler)
     http.ListenAndServe(fmt.Sprintf("%s:%d", conf.Server.IP, conf.Server.Port), nil)
 }
