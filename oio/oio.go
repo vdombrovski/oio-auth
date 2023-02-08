@@ -9,7 +9,6 @@ import (
     "encoding/json"
     "strings"
     "fmt"
-    "log"
 )
 
 const bucketPolicy = "{\"Statement\": [{\"Action\": [\"s3:*\"], \"Effect\": \"Allow\", \"Resource\": [\"*\"], \"Sid\": \"FullAccess\"}]}"
