@@ -33,21 +33,21 @@ const respTpl = "{\"token\":{\"roles\":[]," +
 "\"user\":{\"domain\":{\"id\":\"\",\"name\":\"\"},\"id\":\"%s\",\"name\":\"%s\"}}}"
 
 type project struct {
-    Project *string `json:"project"`
+    Project string `json:"project"`
 }
 
 type user struct {
-    Project *string `json:"project"`
-    User *string `json:"user"`
-    Password *string `json:"password"`
-    Role *string `json:"role"`
+    Project string `json:"project"`
+    User string `json:"user"`
+    Password string `json:"password"`
+    Role string `json:"role"`
 }
 
 type key struct {
-    Project *string `json:"project"`
-    User *string `json:"user"`
-    Access *string `json:"access"`
-    Secret *string `json:"secret"`
+    Project string `json:"project"`
+    User string `json:"user"`
+    Access string `json:"access"`
+    Secret string `json:"secret"`
 }
 
 type cache interface {
@@ -195,13 +195,13 @@ func (hc *httpIface) authorize(proj, usr, token string, adminRequired bool) bool
             return false
         }
         userData := user{
-            Project: &usrStr[0],
-            User: &usrStr[1],
-            Role: &usrStr[2],
+            Project: usrStr[0],
+            User: usrStr[1],
+            Role: usrStr[2],
         }
-        isAdmin := *userData.Role != "admin"
+        isAdmin := userData.Role != "admin"
         // Super users have all privileges
-        if *userData.Project == "root" {
+        if userData.Project == "root" {
             return true
         }
         // Action requires admmin
@@ -209,11 +209,11 @@ func (hc *httpIface) authorize(proj, usr, token string, adminRequired bool) bool
             return false
         }
         // Target project is not user's current project
-        if proj != "" && (*userData.Project != proj) {
+        if proj != "" && (userData.Project != proj) {
             return false
         }
         // Target user is not current user (overriden by project admin)
-        if isAdmin || (usr != "" && (*userData.User != usr)) {
+        if isAdmin || (usr != "" && (userData.User != usr)) {
             return false
         }
         return true
@@ -250,15 +250,14 @@ func (hc *httpIface) metricHandler(w http.ResponseWriter, req *http.Request) {
 func (hc *httpIface) authHandler(w http.ResponseWriter, req *http.Request) {
     switch req.Method {
         case "POST":
-            ph := ""
-            u := user{Project: &ph}
+            u := user{Project: ""}
             hc.decodeJSON(req, &u)
-            if u.Project == nil || u.User == nil || u.Password == nil {
+            if u.Project == "" || u.User == "" || u.Password == "" {
                 // ERR: user, project and password required
                 w.WriteHeader(http.StatusBadRequest)
                 return
             }
-            props, err := hc.PC.ObjectGetProp(hc.rep(*u.Project), hc.rep(*u.User))
+            props, err := hc.PC.ObjectGetProp(hc.rep(u.Project), hc.rep(u.User))
             if err != nil {
                 // ERR: BACKEND ERROR
                 w.WriteHeader(http.StatusServiceUnavailable)
@@ -266,7 +265,7 @@ func (hc *httpIface) authHandler(w http.ResponseWriter, req *http.Request) {
             }
 
             if pwd, ok := props["pwd"]; ok {
-                if cipher, ok := props["self"]; ok && hc.hashPassword(*u.Password) == pwd {
+                if cipher, ok := props["self"]; ok && hc.hashPassword(u.Password) == pwd {
                     rand.Seed(time.Now().UnixNano())
                     token := make([]byte, 256)
                     rand.Read(token)
@@ -315,7 +314,7 @@ func (hc *httpIface) projectHandler(w http.ResponseWriter, req *http.Request) {
                         // Invalid project encryption format, ignore it
                         continue
                     }
-                    projects = append(projects, project{Project: &proj})
+                    projects = append(projects, project{Project: proj})
                 } else {
                     // TODO: Log integrity error: project without name
                     continue
@@ -325,13 +324,12 @@ func (hc *httpIface) projectHandler(w http.ResponseWriter, req *http.Request) {
             fmt.Fprintf(w, string(res))
             return
         case "POST":
-            ph := ""
-            var p = project{Project: &ph}
+            var p = project{}
             err := hc.decodeJSON(req, &p)
             if err != nil {
                 fmt.Println(err)
             }
-            if p.Project == nil {
+            if p.Project == "" {
                 log.Println("Failed to create project; missing project")
                 w.WriteHeader(http.StatusBadRequest)
                 return
@@ -343,34 +341,33 @@ func (hc *httpIface) projectHandler(w http.ResponseWriter, req *http.Request) {
                 return
             }
 
-            if _, err := hc.PC.ContainerGetProps(hc.rep(*p.Project)); err == nil {
-                log.Println("Failed to create project: already exists", *p.Project)
+            if _, err := hc.PC.ContainerGetProps(hc.rep(p.Project)); err == nil {
+                log.Println("Failed to create project: already exists", p.Project)
                 w.WriteHeader(http.StatusConflict)
                 return
             }
 
             // TODO: handle these errors
-            enc, _ := hc.KS.Encrypt(*p.Project)
-            _ = hc.PC.ContainerCreate(hc.rep(*p.Project), map[string]string{
+            enc, _ := hc.KS.Encrypt(p.Project)
+            _ = hc.PC.ContainerCreate(hc.rep(p.Project), map[string]string{
                 "self": enc,
             })
         case "DELETE":
-            ph := ""
-            p := project{Project: &ph}
+            p := project{Project: ""}
             hc.decodeJSON(req, &p)
-            if p.Project == nil {
+            if p.Project == "" {
                 // MISSING PROJECT / USER
                 w.WriteHeader(http.StatusBadRequest)
                 return
             }
 
             // RBAC: Project admins can remove their project
-            if !hc.authorize(*p.Project, "", xAuthToken, true) {
+            if !hc.authorize(p.Project, "", xAuthToken, true) {
                 w.WriteHeader(http.StatusForbidden)
                 return
             }
 
-            err := hc.PC.ContainerDel(hc.rep(*p.Project))
+            err := hc.PC.ContainerDel(hc.rep(p.Project))
             if err != nil {
                 w.WriteHeader(http.StatusBadRequest)
                 return
@@ -382,24 +379,23 @@ func (hc *httpIface) userHandler(w http.ResponseWriter, req *http.Request) {
     xAuthToken := req.Header.Get("X-Auth-Token")
     switch req.Method {
         case "GET":
-            ph := ""
-            p := project{Project: &ph}
+            p := project{Project: ""}
             hc.decodeJSON(req, &p)
 
-            if p.Project == nil {
+            if p.Project == "" {
                 // MISSING PROJECT / USER
                 w.WriteHeader(http.StatusBadRequest)
                 return
             }
 
             // RBAC: Only project admins can view users
-            if !hc.authorize(*p.Project, "", xAuthToken, true) {
+            if !hc.authorize(p.Project, "", xAuthToken, true) {
                 w.WriteHeader(http.StatusForbidden)
                 return
             }
 
             users := []user{}
-            objects, _ := hc.PC.ObjectList(hc.rep(*p.Project), true)
+            objects, _ := hc.PC.ObjectList(hc.rep(p.Project), true)
             for _, obj := range objects {
                 if usrStr, ok := obj.Properties["self"]; ok {
                     decr, err := hc.KS.Decrypt(usrStr)
@@ -412,56 +408,53 @@ func (hc *httpIface) userHandler(w http.ResponseWriter, req *http.Request) {
                         // Invalid userdata encoding
                         continue
                     }
-                    users = append(users, user{User: &usrData[1], Role: &usrData[2]})
+                    users = append(users, user{User: usrData[1], Role: usrData[2]})
                 }
             }
             res, _ := json.Marshal(users)
             fmt.Fprintf(w, string(res))
         case "POST":
-            ph := ""
-            u := user{Project: &ph}
+            u := user{}
             hc.decodeJSON(req, &u)
-            if u.Project == nil || u.User == nil || u.Password == nil  {
+            if u.Project == "" || u.User == "" || u.Password == ""  {
                 log.Println("Failed to create user; missing project or user or password")
                 w.WriteHeader(http.StatusBadRequest)
                 return
             }
 
             // RBAC: Only project admins can add users
-            if !hc.authorize(*u.Project, "", xAuthToken, true) {
+            if !hc.authorize(u.Project, "", xAuthToken, true) {
                 w.WriteHeader(http.StatusForbidden)
                 return
             }
 
-            if u.Role == nil {
-                role := "member"
-                u.Role = &role
+            if u.Role == "" {
+                u.Role = "member"
             }
             // TODO: return 409 on error
 
-            enc, _ := hc.KS.Encrypt(*u.Project + "/" + *u.User + "/" + *u.Role)
+            enc, _ := hc.KS.Encrypt(u.Project + "/" + u.User + "/" + u.Role)
 
-            if _, err := hc.PC.ObjectGetProp(hc.rep(*u.Project), hc.rep(*u.User)); err == nil {
-                log.Println("Failed to create user: already exists", *u.Project, *u.User)
+            if _, err := hc.PC.ObjectGetProp(hc.rep(u.Project), hc.rep(u.User)); err == nil {
+                log.Println("Failed to create user: already exists", u.Project, u.User)
                 w.WriteHeader(http.StatusConflict)
                 return
             }
 
-            hc.PC.ObjectCreate(hc.rep(*u.Project), hc.rep(*u.User), map[string]string{
+            hc.PC.ObjectCreate(hc.rep(u.Project), hc.rep(u.User), map[string]string{
                 "self": enc,
-                "pwd": hc.hashPassword(*u.Password),
+                "pwd": hc.hashPassword(u.Password),
             })
 
-            if err := hc.AC.PolicyCreateDefault(*u.Project, *u.User); err != nil {
-                log.Println("User was created by policy failed, please check manually", *u.Project, *u.User, err)
+            if err := hc.AC.PolicyCreateDefault(u.Project, u.User); err != nil {
+                log.Println("User was created by policy failed, please check manually", u.Project, u.User, err)
                 w.WriteHeader(http.StatusInternalServerError)
                 return
             }
         case "PUT":
-            ph := ""
-            u := user{Project: &ph}
+            u := user{}
             hc.decodeJSON(req, &u)
-            if u.Project == nil || u.User == nil || u.Password == nil  {
+            if u.Project == "" || u.User == "" || u.Password == ""  {
                 // MISSING PROJECT
                 log.Println("missing project")
                 w.WriteHeader(http.StatusBadRequest)
@@ -469,37 +462,36 @@ func (hc *httpIface) userHandler(w http.ResponseWriter, req *http.Request) {
             }
 
             // RBAC: Users can change their own password
-            if !hc.authorize(*u.Project, *u.User, xAuthToken, false) {
+            if !hc.authorize(u.Project, u.User, xAuthToken, false) {
                 w.WriteHeader(http.StatusForbidden)
                 return
             }
 
-            hc.PC.ObjectSetProp(hc.rep(*u.Project), hc.rep(*u.User), map[string]string{
-                "pwd": hc.hashPassword(*u.Password),
+            hc.PC.ObjectSetProp(hc.rep(u.Project), hc.rep(u.User), map[string]string{
+                "pwd": hc.hashPassword(u.Password),
             })
         case "DELETE":
-            ph := ""
-            u := user{Project: &ph}
+            u := user{}
             hc.decodeJSON(req, &u)
-            if u.Project == nil || u.User == nil {
+            if u.Project == "" || u.User == "" {
                 // MISSING PROJECT / USER
                 w.WriteHeader(http.StatusBadRequest)
                 return
             }
             // RBAC: Users can self-delete
-            if !hc.authorize(*u.Project, *u.User, xAuthToken, false) {
+            if !hc.authorize(u.Project, u.User, xAuthToken, false) {
                 w.WriteHeader(http.StatusForbidden)
                 return
             }
 
-            if err := hc.AC.PolicyDelete(*u.Project, *u.User); err != nil {
-                log.Println("Policy delete failed, user was not deleted", *u.Project, *u.User, err)
+            if err := hc.AC.PolicyDelete(u.Project, u.User); err != nil {
+                log.Println("Policy delete failed, user was not deleted", u.Project, u.User, err)
                 w.WriteHeader(http.StatusInternalServerError)
                 return
             }
 
             // TODO: implement rollback
-            err := hc.PC.ObjectDel(hc.rep(*u.Project), hc.rep(*u.User))
+            err := hc.PC.ObjectDel(hc.rep(u.Project), hc.rep(u.User))
             if err != nil {
                 w.WriteHeader(http.StatusBadRequest)
                 return
@@ -511,23 +503,22 @@ func (hc *httpIface) keyHandler(w http.ResponseWriter, req *http.Request) {
     xAuthToken := req.Header.Get("X-Auth-Token")
     switch req.Method {
         case "GET":
-            ph := ""
-            u := user{Project: &ph}
+            u := user{Project: ""}
             hc.decodeJSON(req, &u)
-            if u.Project == nil || u.User == nil {
+            if u.Project == "" || u.User == "" {
                 // MISSING PROJECT
                 w.WriteHeader(http.StatusBadRequest)
                 return
             }
 
             // RBAC: Users can see their keys
-            if !hc.authorize(*u.Project, *u.User, xAuthToken, false) {
+            if !hc.authorize(u.Project, u.User, xAuthToken, false) {
                 w.WriteHeader(http.StatusForbidden)
                 return
             }
 
             res := []key{}
-            keys, _ := hc.PC.ObjectGetProp(hc.rep(*u.Project), hc.rep(*u.User))
+            keys, _ := hc.PC.ObjectGetProp(hc.rep(u.Project), hc.rep(u.User))
             for index, keyPair := range(keys) {
                 if len(index) != 8 {
                     // Not an access key
@@ -538,32 +529,31 @@ func (hc *httpIface) keyHandler(w http.ResponseWriter, req *http.Request) {
                     // Invalid/corrupted key, log and continue
                     continue
                 }
-                accessFull := fmt.Sprintf("%s.%s.%s", *u.Project, *u.User, access)
+                accessFull := fmt.Sprintf("%s.%s.%s", u.Project, u.User, access)
                 res = append(res, key{
-                    Access: &accessFull,
-                    Secret: &secret,
+                    Access: accessFull,
+                    Secret: secret,
                 })
             }
             data, _ := json.Marshal(res)
             fmt.Fprintf(w, string(data))
 
         case "POST":
-            ph := ""
-            u := user{Project: &ph}
+            u := user{}
             hc.decodeJSON(req, &u)
-            if u.Project == nil && u.User == nil {
+            if u.Project == "" && u.User == "" {
                 // MISSING PROJECT
                 w.WriteHeader(http.StatusBadRequest)
                 return
             }
 
             // RBAC: Users can create their keys
-            if !hc.authorize(*u.Project, *u.User, xAuthToken, false) {
+            if !hc.authorize(u.Project, u.User, xAuthToken, false) {
                 w.WriteHeader(http.StatusForbidden)
                 return
             }
 
-            access, secret := util.NewToken(hc.rep(*u.Project), hc.rep(*u.User))
+            access, secret := util.NewToken(hc.rep(u.Project), hc.rep(u.User))
 
             enc, err := hc.KS.Encrypt(access + ":" + secret)
             if err != nil {
@@ -572,7 +562,7 @@ func (hc *httpIface) keyHandler(w http.ResponseWriter, req *http.Request) {
                 return
             }
 
-            err = hc.PC.ObjectSetProp(hc.rep(*u.Project), hc.rep(*u.User), map[string]string{
+            err = hc.PC.ObjectSetProp(hc.rep(u.Project), hc.rep(u.User), map[string]string{
                 hc.rep(access): enc,
             })
             if err != nil {
@@ -581,30 +571,29 @@ func (hc *httpIface) keyHandler(w http.ResponseWriter, req *http.Request) {
                 return
             }
 
-            accessFull := fmt.Sprintf("%s.%s.%s", *u.Project, *u.User, access)
+            accessFull := fmt.Sprintf("%s.%s.%s", u.Project, u.User, access)
 
             data, err := json.Marshal(key{
-                Access: &accessFull,
-                Secret: &secret,
+                Access: accessFull,
+                Secret: secret,
             })
             fmt.Fprintf(w, string(data))
         case "DELETE":
-            ph := ""
-            k := key{Access: &ph}
+            k := key{}
             hc.decodeJSON(req, &k)
-            if k.Access == nil || k.Project == nil || k.User == nil {
+            if k.Access == "" || k.Project == "" || k.User == "" {
                 // MISSING ACCESS KEY / PROJECT / USER
                 w.WriteHeader(http.StatusBadRequest)
                 return
             }
 
             // RBAC: Users can revoke their keys
-            if !hc.authorize(*k.Project, *k.User, xAuthToken, false) {
+            if !hc.authorize(k.Project, k.User, xAuthToken, false) {
                 w.WriteHeader(http.StatusForbidden)
                 return
             }
 
-            err := hc.PC.ObjectDelProp(hc.rep(*k.Project), hc.rep(*k.User), hc.rep(*k.Access))
+            err := hc.PC.ObjectDelProp(hc.rep(k.Project), hc.rep(k.User), hc.rep(k.Access))
             if err != nil {
                 w.WriteHeader(http.StatusBadRequest)
                 return
