@@ -145,6 +145,7 @@ func main() {
 		case "user create", "user update":
 			data["project"] = fs.String("tenant", "", "Tenant")
 			data["user"] = fs.String("user", "", "User")
+			data["role"] = fs.String("role", "member", "Role (admin/member)")
 			data["password"] = fs.String("password", "", "Password (stdin when not provided")
 		case "auth login":
 		default:
@@ -184,6 +185,8 @@ func main() {
 		if k == "password" && *v == "" {
 			password := readPassword()
 			data[k] = &password
+		} else if k == "role" && *v != "member" && *v != "admin" {
+			log.Fatalln("Role must be 'member' or 'admin'")
 		} else if *v == "" {
 			if k == "project" {
 				k = "tenant"

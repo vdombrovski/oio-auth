@@ -434,7 +434,8 @@ func (hc *httpIface) userHandler(w http.ResponseWriter, req *http.Request) {
             }
 
             if u.Role == nil {
-                *u.Role = "member"
+                role := "member"
+                u.Role = &role
             }
             // TODO: return 409 on error
 
